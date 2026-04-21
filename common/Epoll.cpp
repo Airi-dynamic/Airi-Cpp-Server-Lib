@@ -1,6 +1,7 @@
 #include "Epoll.h"
 #include "Channel.h"
 #include "util.h"
+#include <cerrno>
 #include <cstring>
 #include <unistd.h>
 
@@ -45,6 +46,16 @@ void Epoll::updateChannel(Channel *channel) {
     channel->setInEpoll();
 }
 
+void Epoll::deleteChannel(Channel *channel) {
+    int fd = channel->getFd();
+    struct kevent changes[2];
+    EV_SET(&changes[0], fd, EVFILT_READ, EV_DELETE, 0, 0, nullptr);
+    EV_SET(&changes[1], fd, EVFILT_WRITE, EV_DELETE, 0, 0, nullptr);
+    kevent(epfd, &changes[0], 1, nullptr, 0, nullptr);
+    kevent(epfd, &changes[1], 1, nullptr, 0, nullptr);
+    channel->setInEpoll(false);
+}
+
 std::vector<Channel *> Epoll::poll(int timeout) {
     struct timespec ts;
     struct timespec *tsp = nullptr;
@@ -54,7 +65,7 @@ std::vector<Channel *> Epoll::poll(int timeout) {
         tsp = &ts;
     }
     int nfds = kevent(epfd, nullptr, 0, events, MAX_EVENTS, tsp);
-    errif(nfds == -1, "kevent wait error");
+    errif(nfds == -1 && errno != EINTR, "kevent wait error");
 
     std::vector<Channel *> activeChannels;
     for (int i = 0; i < nfds; ++i) {
@@ -106,14 +117,20 @@ void Epoll::updateChannel(Channel *channel) {
         errif(epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev) == -1, "epoll add error");
         channel->setInEpoll();
     } else {
-        errif(epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev), "epoll modify error");
+        errif(epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev) == -1, "epoll modify error");
     }
+}
+
+void Epoll::deleteChannel(Channel *channel) {
+    int fd = channel->getFd();
+    errif(epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL) == -1, "epoll delete error");
+    channel->setInEpoll(false);
 }
 
 std::vector<Channel *> Epoll::poll(int timeout) {
     std::vector<Channel *> activeChannels;
     int nfds = epoll_wait(epfd, events, MAX_EVENTS, timeout);
-    errif(nfds == -1, "epoll wait error");
+    errif(nfds == -1 && errno != EINTR, "epoll wait error");
 
     for (int i = 0; i < nfds; ++i) {
         Channel *ch = (Channel *)events[i].data.ptr;

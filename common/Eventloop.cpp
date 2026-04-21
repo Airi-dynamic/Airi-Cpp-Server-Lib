@@ -1,6 +1,7 @@
 #include "EventLoop.h"
 #include "Channel.h"
 #include "Epoll.h"
+#include <unistd.h>
 #include <vector>
 
 Eventloop::Eventloop() : ep(nullptr), quit(false) {
@@ -23,3 +24,5 @@ void Eventloop::updateChannel(Channel *ch) {
     ep->updateChannel(ch);
     // 以后要更新channel走eventloop中转
 }
+
+void Eventloop::setQuit() { this->quit = true; }

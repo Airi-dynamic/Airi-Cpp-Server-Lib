@@ -4,9 +4,8 @@
 #include <fcntl.h>
 
 void errif(bool condition, const char *message) {
-  if (condition) {
-    perror(message);
-    perror("\n");
-    exit(EXIT_FAILURE);
-  }
+    if (condition) {
+        perror(message);
+        exit(EXIT_FAILURE);
+    }
 }

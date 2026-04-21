@@ -20,6 +20,7 @@ Connection::Connection(Eventloop *_loop, Socket *_sock)
     channel->setReadCallback(std::bind(&Connection::handleRead, this));
     channel->setWriteCallback(std::bind(&Connection::handleWrite, this));
     channel->enableReading();
+    channel->enableET();
 }
 
 Connection::~Connection() {

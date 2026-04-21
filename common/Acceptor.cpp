@@ -2,13 +2,18 @@
 #include "Channel.h"
 #include "InetAddress.h"
 #include "Socket.h"
+#include "util.h"
 #include <cstdio>
 #include <functional>
+#include <sys/socket.h>
 
 Acceptor::Acceptor(Eventloop *_loop)
     : loop(_loop), sock(nullptr), addr(nullptr), acceptChannel(nullptr) {
     sock = new Socket();
     addr = new InetAddress("127.0.0.1", 8888);
+    int opt = 1;
+    errif(setsockopt(sock->getFd(), SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)),
+          "[server] set sock failed.");
     sock->bind(addr);
     sock->listen();
     sock->setnonblocking();
@@ -18,8 +23,8 @@ Acceptor::Acceptor(Eventloop *_loop)
     // 只要有新连接请求，Channel 就会调用我们注册的 acceptConnection
     std::function<void()> cb = std::bind(&Acceptor::acceptConnection, this);
     acceptChannel->setReadCallback(cb);
-    acceptChannel->setWriteCallback(nullptr);
     acceptChannel->enableReading();
+    // 注意：Acceptor 不使用 ET 模式，避免多个连接同时到达时只 accept 一次导致丢连接
 }
 
 Acceptor::~Acceptor() {

@@ -8,9 +8,21 @@ Channel::Channel(Eventloop *_loop, int _fd)
 Channel::~Channel() {}
 
 void Channel::enableReading() {
-    events = POLLER_READ | POLLER_ET;
+    events |= POLLER_READ;
     loop->updateChannel(this);
 }
+
+void Channel::disableReading() {
+    events &= ~POLLER_READ;
+    loop->updateChannel(this);
+}
+
+void Channel::enableET() {
+    events |= POLLER_ET;
+    loop->updateChannel(this);
+}
+
+void Channel::disableET() { events &= ~POLLER_ET; }
 
 void Channel::disableWriting() {
     events &= ~POLLER_WRITE;
@@ -19,6 +31,11 @@ void Channel::disableWriting() {
 
 void Channel::enableWriting() {
     events |= POLLER_WRITE;
+    loop->updateChannel(this);
+}
+
+void Channel::disableAll() {
+    events = 0;
     loop->updateChannel(this);
 }
 

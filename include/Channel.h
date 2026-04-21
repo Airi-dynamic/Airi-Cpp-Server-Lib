@@ -27,8 +27,8 @@ class Channel {
   private:
     Eventloop *loop;
     int fd;
-    uint32_t events;  // 希望监听的事件
-    uint32_t revents; // 目前正在发生的事件
+    uint32_t events;
+    uint32_t revents;
     bool inEpoll;
     std::function<void()> readCallback;
     std::function<void()> writeCallback;
@@ -38,9 +38,17 @@ class Channel {
     ~Channel();
 
     void handleEvent();
+
+    void enableET();
+    void disableET();
+
     void enableReading();
+    void disableReading();
+
     void enableWriting();
     void disableWriting();
+
+    void disableAll();
     bool isWriting();
 
     int getFd();

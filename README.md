@@ -1,47 +1,50 @@
-# Day 11 — StressTest 压力测试
+# Day 12 — 优雅关闭 + Channel 细粒度控制
 
 ## 项目状态
 
-在 Day 10（ThreadPool 线程池）基础上，新增 **StressTest** 多线程压力测试客户端：
+在 Day 11（StressTest）基础上，引入多项改进：
 
-- `StressTest` 启动 N 个客户端线程，各发 M 条消息，校验 Echo 正确性
-- `Server` / `Connection` / `Channel` / `Epoll` 沿用 Day 10 接口，无新增方法
-- 业务逻辑仍通过 ThreadPool 异步执行
+- `server.cpp` 添加 SIGINT 信号处理，支持 Ctrl+C 优雅关闭
+- `Channel` 新增 `enableET()` / `disableET()` / `disableReading()` / `disableAll()` 细粒度事件控制
+- `Epoll` 新增 `deleteChannel()` 从多路复用中移除 fd
+- `Acceptor` 添加 `SO_REUSEADDR` 端口复用
+- `Connection` 构造时显式调用 `enableET()`，读写事件注册解耦
+- `EventLoop` 新增 `setQuit()` 方法控制主循环退出
 
 ## 文件结构
 
 ```
-day11/
+day12/
 ├── CMakeLists.txt
-├── server.cpp
+├── server.cpp              ← 修改：信号处理
 ├── client.cpp
 ├── include/
 │   ├── ThreadPool.h
 │   ├── Connection.h
 │   ├── Server.h
 │   ├── Buffer.h
-│   ├── Channel.h
+│   ├── Channel.h           ← 修改：enableET/disableET/disableAll
 │   ├── Acceptor.h
-│   ├── EventLoop.h
-│   ├── Epoll.h
+│   ├── EventLoop.h         ← 修改：setQuit
+│   ├── Epoll.h             ← 修改：deleteChannel
 │   ├── Socket.h
 │   ├── InetAddress.h
 │   └── util.h
 ├── common/
 │   ├── ThreadPool.cpp
-│   ├── Connection.cpp
+│   ├── Connection.cpp      ← 修改：显式 enableET
 │   ├── Server.cpp
 │   ├── Buffer.cpp
-│   ├── Channel.cpp
-│   ├── Acceptor.cpp
-│   ├── Eventloop.cpp
-│   ├── Epoll.cpp
+│   ├── Channel.cpp         ← 修改：细粒度控制实现
+│   ├── Acceptor.cpp        ← 修改：SO_REUSEADDR
+│   ├── Eventloop.cpp       ← 修改：setQuit 实现
+│   ├── Epoll.cpp           ← 修改：deleteChannel + EINTR
 │   ├── Socket.cpp
 │   ├── InetAddress.cpp
 │   └── util.cpp
 └── test/
     ├── ThreadPoolTest.cpp
-    └── StressTest.cpp    ← 新增
+    └── StressTest.cpp
 ```
 
 ## 编译与运行
@@ -50,19 +53,17 @@ day11/
 cmake -S . -B build
 cmake --build build
 
-# 终端 1：启动服务器
+# 启动服务器（Ctrl+C 优雅关闭）
 ./build/server
-
-# 终端 2：运行压力测试（10 线程，每线程 100 条消息）
-./build/StressTest 10 100
-
-# 终端 3：运行客户端（手动测试）
-./build/client
 ```
 
-## 与 Day 10 的区别
+## 与 Day 11 的区别
 
 | 变更 | 说明 |
 |------|------|
-| 新增 `test/StressTest.cpp` | 多线程压力测试，验证 Echo 服务正确性 |
-| 其余文件无变化 | Server/Connection/Channel/Epoll/Buffer 完全沿用 Day 10 |
+| `server.cpp` | 新增 signal(SIGINT) 处理，调用 setQuit() |
+| `Channel` | 新增 enableET/disableET/disableReading/disableAll |
+| `Epoll` | 新增 deleteChannel；poll 增加 EINTR 容错 |
+| `Acceptor` | 添加 SO_REUSEADDR 端口复用 |
+| `Connection` | 构造时显式 enableET()，与 enableReading 解耦 |
+| `EventLoop` | 新增 setQuit() |
