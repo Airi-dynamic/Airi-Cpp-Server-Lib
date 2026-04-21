@@ -1,6 +1,8 @@
 #include "EventLoop.h"
 #include "Channel.h"
 #include "Poller/Poller.h"
+#include "timer/TimerQueue.h"
+#include "timer/TimeStamp.h"
 #include "util.h"
 #include <functional>
 #include <memory>
@@ -19,6 +21,7 @@ Eventloop::Eventloop() : poller_(nullptr), quit_(false), tid_(std::this_thread::
     // 配合 EventLoopThread 使用后，构造和 loop() 调用均在同一子线程，
     // isInLoopThread() 的判断结果永远正确。
     poller_ = Poller::newDefaultPoller(this); // 工厂返回 unique_ptr，直接 move 赋值
+    timerQueue_ = std::make_unique<TimerQueue>(this);
 
 #ifdef __linux__
     evtfd_ = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
@@ -74,9 +77,16 @@ void Eventloop::wakeup() {
 
 void Eventloop::loop() {
     while (!quit_) {
-        std::vector<Channel *> channels = poller_->poll();
+        // 动态计算 poll 超时：
+        //   -1  → 无定时器，永久阻塞直到有 IO 事件或 wakeup
+        //   0   → 有已过期定时器，立即返回
+        //   >0  → 等待该毫秒数后最早的定时器将到期
+        int timeout = timerQueue_->nextTimeoutMs();
+        std::vector<Channel *> channels = poller_->poll(timeout);
         for (auto *ch : channels)
             ch->handleEvent();
+        // 处理到期定时器（在 IO 事件之后、pending functors 之前）
+        timerQueue_->processExpiredTimers();
         doPendingFunctors();
     }
 }
@@ -113,4 +123,22 @@ void Eventloop::runInLoop(std::function<void()> func) {
         // 跨线程调用：投递到 pendingFunctors_，由归属线程在下次 doPendingFunctors() 时执行
         queueInLoop(std::move(func));
     }
+}
+
+void Eventloop::runAt(TimeStamp when, std::function<void()> cb) {
+    // 通过 runInLoop 确保 addTimer 在 EventLoop 线程执行（TimerQueue 不加锁）
+    runInLoop([this, when, cb = std::move(cb)]() mutable {
+        timerQueue_->addTimer(when, std::move(cb), 0.0);
+    });
+}
+
+void Eventloop::runAfter(double seconds, std::function<void()> cb) {
+    runAt(TimeStamp::addSeconds(TimeStamp::now(), seconds), std::move(cb));
+}
+
+void Eventloop::runEvery(double seconds, std::function<void()> cb) {
+    runInLoop([this, seconds, cb = std::move(cb)]() mutable {
+        timerQueue_->addTimer(TimeStamp::addSeconds(TimeStamp::now(), seconds),
+                              std::move(cb), seconds);
+    });
 }

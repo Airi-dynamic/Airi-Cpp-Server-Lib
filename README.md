@@ -1,36 +1,44 @@
-# Day 22 — ET 循环读 + Connection 状态守卫
+# Day 23 — 跨平台定时器（TimerQueue）
 
-## 核心变更
-- **ET 循环读**：`Connection::doRead()` 改为循环读至 `EAGAIN`，解决 ET 模式下缓冲区残留导致客户端卡死
-- **Business() 状态守卫**：kqueue/epoll 同批次多事件时防止已 close 的 Connection 被重入处理
-- **doWrite() 状态检查**：关闭态不再写入数据
+在 EventLoop 中集成定时器系统，支持一次性（`runAfter`）与重复（`runEvery`）定时任务。采用 poll 超时驱动方案，无需 Linux 专有的 `timerfd_create`，Linux/macOS 通用。
 
-## 构建
+## 新增模块
+
+| 文件 | 说明 |
+|------|------|
+| `include/timer/TimeStamp.h` | 微秒精度时间戳（header-only） |
+| `include/timer/Timer.h` | 单个定时任务：到期时刻 + 回调 + 重复间隔 |
+| `include/timer/TimerQueue.h` | 定时器有序队列（`std::set`） |
+| `common/timer/TimerQueue.cpp` | 插入、超时计算、过期处理 |
+| `test/TimerTest.cpp` | 定时器功能测试 |
+
+## 构建 & 运行
 
 ```bash
-cmake -S . -B build
-cmake --build build -j4
+cd HISTORY/day23
+cmake -S . -B build && cmake --build build -j4
+
+# 运行定时器测试
+./build/TimerTest
+
+# 运行 echo 服务器
+./build/server
+# 另一终端
+./build/client
 ```
 
-生成 `server`、`client`、`ThreadPoolTest`、`StressTest` 四个可执行文件。
+## 可执行文件
 
-## 文件结构
+| 名称 | 说明 |
+|------|------|
+| `server` | Echo 服务器（带定时器） |
+| `client` | TCP 客户端 |
+| `TimerTest` | 定时器测试（一次性 + 重复 + 跨线程） |
+| `ThreadPoolTest` | 线程池测试 |
+| `StressTest` | 压力测试客户端 |
 
-```
-├── server.cpp / client.cpp         入口
-├── include/
-│   ├── TcpServer.h                 同 Day 21
-│   ├── EventLoopThread.h           同 Day 21
-│   ├── EventLoopThreadPool.h       同 Day 21
-│   ├── EventLoop.h                 同 Day 21
-│   ├── Connection.h                同 Day 21
-│   ├── Poller/                     策略模式（同 Day 18）
-│   └── ...
-├── common/
-│   ├── Connection.cpp              ET 循环读 + 状态守卫
-│   ├── TcpServer.cpp               同 Day 21
-│   ├── EventLoopThread.cpp         同 Day 21
-│   ├── EventLoopThreadPool.cpp     同 Day 21
-│   └── Poller/                     同 Day 18
-└── test/                           ThreadPoolTest / StressTest
-```
+## 核心设计
+
+- `TimerQueue` 使用 `std::set<{TimeStamp, Timer*}>` 按到期时刻排序
+- `nextTimeoutMs()` 返回值直接传给 `poll()`/`kevent()` 的 timeout 参数
+- 所有定时器操作通过 `runInLoop` 投递，TimerQueue 无需加锁
