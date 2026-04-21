@@ -1,9 +1,9 @@
-#include "Connection.h"
-#include "EventLoop.h"
-#include "EventLoopThread.h"
-#include "SignalHandler.h"
-#include "TcpServer.h"
-#include "timer/TimeStamp.h"
+#include "include/Connection.h"
+#include "include/EventLoop.h"
+#include "include/EventLoopThread.h"
+#include "include/SignalHandler.h"
+#include "include/TcpServer.h"
+#include "include/timer/TimeStamp.h"
 #include <atomic>
 #include <iostream>
 #include <thread>
@@ -24,8 +24,8 @@ int main() {
     });
 
     server.newConnect([](Connection *conn) {
-        std::cout << "[server] New client connected, fd=" << conn->getSocket()->getFd() << " at "
-                  << TimeStamp::now().toString() << std::endl;
+        std::cout << "[server] New client connected, fd=" << conn->getSocket()->getFd()
+                  << " at " << TimeStamp::now().toString() << std::endl;
 
         // Phase 2 演示：为每条新连接在其归属的 sub-reactor 上添加一个空闲超时定时器。
         // 若 60 秒内连接没有被关闭（业务层未调用 conn->close()），则主动断开。

@@ -1,7 +1,9 @@
 #include "http/HttpServer.h"
 #include "Connection.h"
+#include "EventLoop.h"
 #include "http/HttpContext.h"
 #include "log/Logger.h"
+#include "timer/TimeStamp.h"
 #include <functional>
 
 HttpServer::HttpServer() : server_(std::make_unique<TcpServer>()) {
@@ -19,8 +21,41 @@ void HttpServer::stop() { server_->stop(); }
 
 // ── 新连接建立：为每条连接创建独立的 HttpContext ─────────────────────────────
 void HttpServer::onNewConnection(Connection *conn) {
-    conn->setContext(HttpContext{}); // 在 Connection::context_ 中存放 HttpContext
+    conn->setContext(HttpContext{});
+    conn->touchLastActive(); // 记录连接建立时间作为初始活跃时间
+
+    if (autoClose_)
+        scheduleIdleClose(conn);
+
     LOG_INFO << "[HttpServer] new connection fd=" << conn->getSocket()->getFd();
+}
+
+// ── 空闲超时定时器（递归调度）────────────────────────────────────────────────
+// 安全模型：
+//   - aliveFlag 是 weak_ptr<bool>，Connection 析构时将 *alive 置 false
+//   - 定时器与 Connection 共属同一个 sub-reactor EventLoop（单线程），无竞态
+//   - 若到期时连接已关闭（*alive==false），lambda 直接返回，不会出现悬空访问
+void HttpServer::scheduleIdleClose(Connection *conn) {
+    std::weak_ptr<bool> weak = conn->aliveFlag();
+    double timeout = idleTimeout_;
+
+    conn->getLoop()->runAfter(timeout, [weak, conn, this]() {
+        // 尝试锁定 alive flag；若 Connection 已析构，lock() 返回 nullptr
+        auto alive = weak.lock();
+        if (!alive || !*alive)
+            return; // 连接已经消失，无需处理
+
+        // 比对最后活跃时间
+        TimeStamp deadline = TimeStamp::addSeconds(conn->lastActive(), idleTimeout_);
+        if (TimeStamp::now() < deadline) {
+            // 连接仍然活跃，重新调度下一次检测
+            scheduleIdleClose(conn);
+        } else {
+            LOG_INFO << "[HttpServer] idle timeout, closing fd="
+                     << conn->getSocket()->getFd();
+            conn->close();
+        }
+    });
 }
 
 // ── 数据到达：调用 HttpContext 状态机解析 ─────────────────────────────────────
@@ -35,6 +70,10 @@ void HttpServer::onMessage(Connection *conn) {
         conn->close();
         return;
     }
+
+    // 每次收到数据即更新活跃时间（供空闲超时计时器参考）
+    if (autoClose_)
+        conn->touchLastActive();
 
     Buffer *buf = conn->getInputBuffer();
     const char *data = buf->peek();

@@ -201,18 +201,22 @@ bool HttpContext::parse(const char *data, int len) {
             break;
 
         // ── 请求体：按 Content-Length 读取指定字节数 ──────────────────────────
+        // 关键：使用 appendBody() 而非 setBody(body() + chunk)，避免 O(n²) 拷贝。
+        // 对于大文件上传（multipart 体跨多个 TCP 段），这一点至关重要：
+        //   旧代码：每次调用都生成全量 string 副本，138KB 文件 ≈ 9 次 × 平均 70KB = 630KB 无效分配
+        //   新代码：body_.append() 直接扩容，均摊 O(1)
         case State::kBody: {
-            std::string cl = request_.header("Content-Length");
+            // Content-Length 只需从 headers map 读取一次；bodyLen 在每次重入时重新计算但不昂贵
+            const std::string &cl = request_.header("Content-Length");
             int bodyLen = cl.empty() ? 0 : std::atoi(cl.c_str());
+            int alreadyRead = static_cast<int>(request_.body().size());
             int remaining = static_cast<int>(end - p);
-            int toRead = std::min(bodyLen - static_cast<int>(request_.body().size()), remaining);
+            int toRead = std::min(bodyLen - alreadyRead, remaining);
             if (toRead > 0) {
-                // append 而非替换，支持 body 跨 TCP 段分片到达
-                request_.setBody(request_.body() + std::string(p, p + toRead));
+                request_.appendBody(p, toRead); // O(1) 均摊，无副本
                 p += toRead;
             } else {
-                // 没有更多数据：退出循环，等待下次 parse() 调用
-                goto done;
+                goto done; // 当前 TCP 段已读尽，等待下次 parse() 调用
             }
             if (static_cast<int>(request_.body().size()) >= bodyLen) {
                 state_ = State::kComplete;

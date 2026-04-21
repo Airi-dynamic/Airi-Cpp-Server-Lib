@@ -1,8 +1,8 @@
 #include "log/Logger.h"
+#include "timer/TimeStamp.h"
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
-#include <thread>
 
 // ── 全局状态 ──────────────────────────────────────────────────────────────────
 
@@ -41,8 +41,7 @@ void Logger::Impl::finish() {
 
 // ── Logger ───────────────────────────────────────────────────────────────────
 
-Logger::Logger(SourceFile file, int line, LogLevel level)
-    : impl_(level, file, line) {}
+Logger::Logger(SourceFile file, int line, LogLevel level) : impl_(level, file, line) {}
 
 Logger::~Logger() {
     impl_.finish();

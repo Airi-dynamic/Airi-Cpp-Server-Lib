@@ -26,7 +26,10 @@ Connection::Connection(int fd, Eventloop *loop)
 }
 
 Connection::~Connection() {
-    // 先从 Poller 中注销 Channel，防止 kqueue/epoll 保留悬空 udata 指针
+    // alive_ 置 false：通知所有持有 weak_ptr<bool> 的定时器回调此连接已销毁，
+    // 避免回调在 Connection 内存释放后通过 raw pointer 访问悬空对象
+    *alive_ = false;
+    // 再从 Poller 中注销 Channel，防止 kqueue/epoll 保留悬空 udata 指针
     loop_->deleteChannel(channel_.get());
 }
 

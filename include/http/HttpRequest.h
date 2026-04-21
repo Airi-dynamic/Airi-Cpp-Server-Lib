@@ -35,6 +35,8 @@ class HttpRequest {
 
     // ── 请求体 ─────────────────────────────────────────────────────────────────
     void setBody(const std::string &body) { body_ = body; }
+    // 高效追加：避免 O(n²) 的 setBody(body() + chunk) 拼接，用于跨 TCP 分段累积
+    void appendBody(const char *data, int len) { body_.append(data, len); }
     const std::string &body() const { return body_; }
 
     void reset(); // 清空所有字段，供 keep-alive 复用

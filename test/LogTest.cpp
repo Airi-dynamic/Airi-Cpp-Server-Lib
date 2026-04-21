@@ -1,6 +1,5 @@
 #include "log/AsyncLogging.h"
 #include "log/Logger.h"
-#include "timer/TimeStamp.h"
 #include <atomic>
 #include <chrono>
 #include <iostream>

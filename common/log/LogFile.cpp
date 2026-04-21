@@ -2,7 +2,6 @@
 #include <cassert>
 #include <cstring>
 #include <ctime>
-#include <stdexcept>
 
 LogFile::LogFile(const std::string &basename, size_t rollSizeBytes)
     : basename_(basename), rollSizeBytes_(rollSizeBytes), writtenBytes_(0), fp_(nullptr) {

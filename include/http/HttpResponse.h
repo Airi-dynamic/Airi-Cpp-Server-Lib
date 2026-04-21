@@ -9,7 +9,7 @@ class HttpResponse {
     enum class StatusCode {
         kUnknown = 0,
         k200OK = 200,
-        k301MovedPermanently = 301,
+        k302Found = 302,          // 临时重定向（Location 头指定新地址）
         k400BadRequest = 400,
         k403Forbidden = 403,
         k404NotFound = 404,

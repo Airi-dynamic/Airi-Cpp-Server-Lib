@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(day25 LANGUAGES CXX)
+project(day26 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -71,3 +71,10 @@ add_executable(StressTest
     common/Socket.cpp
     common/util.cpp
 )
+
+add_executable(BenchmarkTest test/BenchmarkTest.cpp)
+target_link_libraries(BenchmarkTest pthread)
+
+# 将静态资源和数据文件拷贝到 build 目录
+file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/static DESTINATION ${CMAKE_BINARY_DIR})
+file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/files DESTINATION ${CMAKE_BINARY_DIR})

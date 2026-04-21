@@ -1,8 +1,6 @@
 #pragma once
 #include "Macros.h"
 #include "log/LogStream.h"
-#include "timer/TimeStamp.h"
-#include <atomic>
 #include <cstring>
 #include <functional>
 

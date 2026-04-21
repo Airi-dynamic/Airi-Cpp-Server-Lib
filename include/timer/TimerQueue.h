@@ -4,7 +4,6 @@
 #include <functional>
 #include <set>
 #include <utility>
-#include <vector>
 
 class Timer;
 class Eventloop;

@@ -3,6 +3,7 @@
 #include "Channel.h"
 #include "Macros.h"
 #include "Socket.h"
+#include "timer/TimeStamp.h"
 #include <any>
 #include <functional>
 #include <memory>
@@ -54,6 +55,14 @@ class Connection {
     template <typename T>
     T *getContextAs() { return std::any_cast<T>(&context_); }
 
+    // ── 空闲超时支持 ─────────────────────────────────────────────────────────
+    // alive_：shared_ptr<bool> 作为"存活标志"，Connection 析构时置 false。
+    // 定时器回调持有 weak_ptr<bool>，通过 lock() 判断连接是否仍在生命周期内，
+    // 规避 raw pointer 悬空 UB（EventLoop 单线程执行保证时序安全）。
+    std::weak_ptr<bool> aliveFlag() const { return alive_; }
+    void touchLastActive() { lastActive_ = TimeStamp::now(); }
+    TimeStamp lastActive() const { return lastActive_; }
+
   private:
     State state_{State::kInvalid};
     Eventloop *loop_;
@@ -63,6 +72,11 @@ class Connection {
     Buffer outputBuffer_;
 
     std::any context_; // 上层协议附挂的每连接状态（如 HttpContext）
+
+    // 空闲超时安全机制：析构时将 *alive_ 置 false，
+    // 使持有 weak_ptr 的定时器回调能安全判断连接是否已销毁
+    std::shared_ptr<bool> alive_{std::make_shared<bool>(true)};
+    TimeStamp lastActive_;
 
     std::function<void(int)> deleteConnectionCallback_;
     // 业务处理回调，当 Buffer 有数据时被调用

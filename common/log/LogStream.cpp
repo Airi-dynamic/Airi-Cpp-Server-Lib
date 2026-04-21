@@ -1,5 +1,4 @@
 #include "log/LogStream.h"
-#include <cstdio>
 #include <cstring>
 
 LogStream &LogStream::operator<<(bool v) {
