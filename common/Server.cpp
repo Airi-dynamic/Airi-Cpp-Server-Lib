@@ -1,4 +1,5 @@
 #include "Server.h"
+#include "Acceptor.h"
 #include "Channel.h"
 #include "InetAddress.h"
 #include "Socket.h"
@@ -8,36 +9,30 @@
 #include <cstring>
 #include <functional>
 #include <iostream>
-#include <ostream>
-#include <strings.h>
 #include <unistd.h>
 
 #define READ_BUFFER 1024
 
 Server::Server(Eventloop *_loop) : loop(_loop) {
-    // 现在在这里初始化服务器资源
-    server_sock = new Socket();
-    server_addr = new InetAddress("127.0.0.1", 8888);
-    server_sock->bind(server_addr);
-    server_sock->listen();
-    server_sock->setnonblocking();
-
-    server_sock_channel = new Channel(loop, server_sock->getFd());
-    std::function<void()> cb = std::bind(&Server::handleReadEvent, this);
-    server_sock_channel->setCallback(cb);
-    server_sock_channel->enableReading();
+    // 现在资源初始化交由 Acceptor
+    acceptor = new Acceptor(loop);
+    std::function<void(Socket *, InetAddress *)> cb =
+        std::bind(&Server::newConnection, this, std::placeholders::_1, std::placeholders::_2);
+    acceptor->setNewConnectionCallback(cb);
 }
 
-Server::~Server() {
-    delete server_sock;
-    delete server_addr;
-    delete server_sock_channel;
-}
+Server::~Server() { delete acceptor; }
 
-void Server::handleReadEvent() {
-    // 这里是原来的 Accept 逻辑
-    InetAddress *client_addr = new InetAddress();
-    int client_sockfd = server_sock->accept(client_addr);
+// 这个函数就是以前 accept 之后的那部分逻辑
+void Server::newConnection(Socket *client_sock, InetAddress *client_addr) {
+    // 注意：server_sock 是 Acceptor new 出来传给我们的
+    // 在 Day 7 阶段，为了防止内存泄漏，Server 应该接管这个 Socket 的生命周期
+    // 但因为还没写 TCPConnection 类，这里暂且还是只能看着它泄漏或者简单 delete
+
+    int client_sockfd = client_sock->getFd();
+
+    // 下面的逻辑和 Day 6 的 handleReadEvent 后半部分一样
+    // 为客户端 socket 建立 Channel，设置读回调
 
     std::cout << "[server] new client fd" << client_sockfd
               << "! IP:" << inet_ntoa(client_addr->addr.sin_addr) << " PortL "
@@ -45,8 +40,7 @@ void Server::handleReadEvent() {
 
     // 为新的客户端连接创建 Socket 和 Channel
     // 还是有内存泄漏，以后处理
-    Socket *client_sock = new Socket(client_sockfd);
-    client_sock->setnonblocking();
+
     Channel *clientChannel = new Channel(loop, client_sockfd);
 
     // 数据处理的lambda函数
@@ -76,6 +70,4 @@ void Server::handleReadEvent() {
 
     clientChannel->setCallback(cb);
     clientChannel->enableReading();
-
-    delete client_addr;
 }
