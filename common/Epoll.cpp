@@ -1,9 +1,8 @@
 #include "Epoll.h"
+#include "Channel.h"
 #include "util.h"
 #include <cstring>
-#include <strings.h>
 #include <unistd.h>
-#include <vector>
 
 #define MAX_EVENTS 1024
 
@@ -17,22 +16,20 @@ Epoll::Epoll() : epfd(-1), events(nullptr) {
 }
 
 Epoll::~Epoll() {
-  if (epfd != -1) {
-    close(epfd);
-    epfd = -1;
-  }
+  if (epfd != -1) { close(epfd); epfd = -1; }
   delete[] events;
 }
 
-void Epoll::addFd(int fd, uint32_t op) {
+void Epoll::updateChannel(Channel *channel) {
+  int fd = channel->getFd();
   struct kevent change;
-  (void)op; // flags are implicit: always READ + EV_CLEAR (edge-triggered)
-  EV_SET(&change, fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, nullptr);
+  EV_SET(&change, fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, (void *)channel);
   errif(kevent(epfd, &change, 1, nullptr, 0, nullptr) == -1,
-        "kqueue add event error");
+        "kqueue update error");
+  channel->setInEpoll();
 }
 
-std::vector<ActiveEvent> Epoll::poll(int timeout) {
+std::vector<Channel *> Epoll::poll(int timeout) {
   struct timespec ts;
   struct timespec *tsp = nullptr;
   if (timeout >= 0) {
@@ -43,14 +40,13 @@ std::vector<ActiveEvent> Epoll::poll(int timeout) {
   int nfds = kevent(epfd, nullptr, 0, events, MAX_EVENTS, tsp);
   errif(nfds == -1, "kevent wait error");
 
-  std::vector<ActiveEvent> active_events;
+  std::vector<Channel *> activeChannels;
   for (int i = 0; i < nfds; ++i) {
-    ActiveEvent ae;
-    ae.fd = static_cast<int>(events[i].ident);
-    ae.events = POLLER_READ;
-    active_events.push_back(ae);
+    Channel *ch = (Channel *)events[i].udata;
+    ch->setRevents(POLLER_READ);
+    activeChannels.push_back(ch);
   }
-  return active_events;
+  return activeChannels;
 }
 
 #else // Linux epoll
@@ -63,33 +59,35 @@ Epoll::Epoll() : epfd(-1), events(nullptr) {
 }
 
 Epoll::~Epoll() {
-  if (epfd != -1) {
-    close(epfd);
-    epfd = -1;
-  }
+  if (epfd != -1) { close(epfd); epfd = -1; }
   delete[] events;
 }
 
-void Epoll::addFd(int fd, uint32_t op) {
+void Epoll::updateChannel(Channel *channel) {
+  int fd = channel->getFd();
   struct epoll_event ev;
-  bzero(&ev, sizeof(ev));
-  ev.data.fd = fd;
-  ev.events = op;
-  errif(epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev), "epoll add event error");
+  ev.data.ptr = channel;
+  ev.events = channel->getEvents();
+
+  if (!channel->getInEpoll()) {
+    errif(epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev) == -1, "epoll add error");
+    channel->setInEpoll();
+  } else {
+    errif(epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev), "epoll modify error");
+  }
 }
 
-std::vector<ActiveEvent> Epoll::poll(int timeout) {
-  std::vector<ActiveEvent> active_events;
+std::vector<Channel *> Epoll::poll(int timeout) {
+  std::vector<Channel *> activeChannels;
   int nfds = epoll_wait(epfd, events, MAX_EVENTS, timeout);
   errif(nfds == -1, "epoll wait error");
 
   for (int i = 0; i < nfds; ++i) {
-    ActiveEvent ae;
-    ae.fd = events[i].data.fd;
-    ae.events = events[i].events;
-    active_events.push_back(ae);
+    Channel *ch = (Channel *)events[i].data.ptr;
+    ch->setRevents(events[i].events);
+    activeChannels.push_back(ch);
   }
-  return active_events;
+  return activeChannels;
 }
 
 #endif

@@ -20,4 +20,6 @@ public:
   void connect(InetAddress *addr);
 
   int getFd();
+
+  void setnonblocking();
 };

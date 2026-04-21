@@ -1,4 +1,5 @@
 #pragma once
+#include "Channel.h"
 #include <cstdint>
 #include <vector>
 
@@ -7,12 +8,6 @@
 #else
 #include <sys/epoll.h>
 #endif
-
-// 统一的活跃事件结构
-struct ActiveEvent {
-  int fd;
-  uint32_t events; // POLLIN-like flags
-};
 
 // 平台标志常量
 #ifdef __APPLE__
@@ -35,6 +30,6 @@ private:
 public:
   Epoll();
   ~Epoll();
-  void addFd(int fd, uint32_t op);
-  std::vector<ActiveEvent> poll(int timeout = -1);
+  void updateChannel(Channel *channel);
+  std::vector<Channel *> poll(int timeout = -1);
 };

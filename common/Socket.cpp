@@ -38,3 +38,9 @@ void Socket::connect(InetAddress *addr) {
 }
 
 int Socket::getFd() { return fd; }
+
+void Socket::setnonblocking() {
+  int oldoptions = fcntl(fd, F_GETFL);
+  int new_option = oldoptions | O_NONBLOCK;
+  fcntl(fd, F_SETFL, new_option);
+}
