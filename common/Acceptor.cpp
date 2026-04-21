@@ -20,8 +20,8 @@ Acceptor::Acceptor(Eventloop *loop, const char *ip, uint16_t port) {
     int opt = 1;
     if (setsockopt(sock_->getFd(), SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) != 0) {
         // SO_REUSEADDR 失败通常不影响正确性，仅影响端口快速复用能力。
-        LOG_WARN << "[Acceptor] setsockopt(SO_REUSEADDR) 失败，继续启动，错误="
-                 << strerror(errno) << " errno=" << errno;
+        LOG_WARN << "[Acceptor] setsockopt(SO_REUSEADDR) 失败，继续启动，错误=" << strerror(errno)
+                 << " errno=" << errno;
     }
 
     if (!sock_->bind(&addr)) {
@@ -48,12 +48,11 @@ void Acceptor::acceptConnection() {
     int clientFd = sock_->accept(&clientAddr);
     if (clientFd == -1) {
         // 非阻塞 accept 在高并发下会频繁出现以下“可恢复错误”，不应导致进程退出。
-        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR ||
-            errno == ECONNABORTED || errno == EPROTO)
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR || errno == ECONNABORTED ||
+            errno == EPROTO)
             return;
 
-        LOG_ERROR << "[Acceptor] accept 失败，错误=" << strerror(errno)
-                  << " errno=" << errno;
+        LOG_ERROR << "[Acceptor] accept 失败，错误=" << strerror(errno) << " errno=" << errno;
         return;
     }
 

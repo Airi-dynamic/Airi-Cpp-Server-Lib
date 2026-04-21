@@ -1,7 +1,25 @@
+// HTTP 文件服务器示例：演示如何在 day29 网络库 + 库级中间件之上搭建一个生产级
+// HTTP 应用。所有 HTTP 标准行为（CORS / gzip / ETag / Range / 304 / 206 ...）
+// 都已经下沉到 include/http/ 中的中间件与工具类，本文件只关注 **业务路由**。
+//
+// 应用层职责：
+//   * 注册 CORS / gzip / 安全响应头中间件
+//   * 提供首页、登录、文件管理 / 上传 / 下载 / 删除等业务路由
+//   * 静态资源走 StaticFileHandler::serve()，自动获得 ETag/304/Range/sendfile
+//
+// 库层职责（include/http/）：
+//   * CorsMiddleware     —— 跨域响应头 + 预检 204
+//   * GzipMiddleware     —— Accept-Encoding 协商 + zlib 压缩
+//   * StaticFileHandler  —— ETag / Last-Modified / 304 / Range / 416 / sendfile
+//   * HttpServer         —— 中间件链 / 路由表 / 请求超时 / 大小限制
+//   * Connection         —— sendfile 零拷贝、TLS（条件编译）
 #include <SignalHandler.h>
+#include <http/CorsMiddleware.h>
+#include <http/GzipMiddleware.h>
 #include <http/HttpRequest.h>
 #include <http/HttpResponse.h>
 #include <http/HttpServer.h>
+#include <http/StaticFileHandler.h>
 #include <log/AsyncLogging.h>
 #include <log/Logger.h>
 
@@ -9,10 +27,12 @@
 #include <cerrno>
 #include <cstdlib>
 #include <dirent.h>
+#include <fcntl.h>
 #include <fstream>
 #include <iostream>
 #include <limits>
 #include <sstream>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <unordered_map>
@@ -29,17 +49,12 @@ static const std::string kFilesDir = "files";   // 用户文件目录（相对 C
 //   1. 在 main() 单线程阶段填充，之后只读 → 无需加锁，并发安全
 //   2. key = 文件路径（相对 CWD），value = 文件内容字符串
 //   3. 对内容会变化的动态页面（文件列表）不做缓存，仍按需生成
-//
-// 实测效果（loopback，4 线程 BenchmarkTest）：
-//   优化前：每次 GET / 触发 open+read(index.html) ≈ 3-5μs 文件系统开销
-//   优化后：直接返回缓存字符串，节省系统调用，QPS 提升约 15-20%
 static std::unordered_map<std::string, std::string> g_staticCache;
 
-// 启动时调用：将指定目录下所有文件预加载到缓存
 static void preloadStaticCache(const std::string &dir) {
     DIR *dp = opendir(dir.c_str());
     if (!dp) {
-        std::cerr << "[static cache] cannot open dir: " << dir << "\n";
+        LOG_ERROR << "[static cache] cannot open dir: " << dir;
         return;
     }
     int count = 0;
@@ -60,30 +75,49 @@ static void preloadStaticCache(const std::string &dir) {
         ++count;
     }
     closedir(dp);
-    std::cout << "[static cache] preloaded " << count << " files from " << dir << "\n";
+    LOG_INFO << "[static cache] preloaded " << count << " files from " << dir;
 }
 
-// ── 通用工具函数 ───────────────────────────────────────────────────────────────
-
-// 读取文件到 string（二进制安全）。
-// 返回 {found, data}：found=false 表示文件不存在或无法打开，与 data 为空的0字节文件区别开来。
+// 读取文件到 string（mmap 快路径，不可用时降级 ifstream）。
+// 返回 {found, data}：found=false 表示文件不存在。
 static std::pair<bool, std::string> readFileSafe(const std::string &path) {
-    std::ifstream ifs(path, std::ios::in | std::ios::binary);
-    if (!ifs)
+    int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd == -1)
         return {false, {}};
-    return {true, {std::istreambuf_iterator<char>(ifs), std::istreambuf_iterator<char>()}};
+
+    struct stat st{};
+    if (::fstat(fd, &st) == -1 || !S_ISREG(st.st_mode)) {
+        ::close(fd);
+        return {false, {}};
+    }
+
+    if (st.st_size == 0) {
+        ::close(fd);
+        return {true, {}};
+    }
+
+    void *mapped = ::mmap(nullptr, static_cast<size_t>(st.st_size), PROT_READ, MAP_PRIVATE, fd, 0);
+    if (mapped == MAP_FAILED) {
+        ::close(fd);
+        std::ifstream ifs(path, std::ios::in | std::ios::binary);
+        if (!ifs)
+            return {false, {}};
+        return {true, {std::istreambuf_iterator<char>(ifs), std::istreambuf_iterator<char>()}};
+    }
+
+    std::string data(static_cast<const char *>(mapped), static_cast<size_t>(st.st_size));
+    ::munmap(mapped, static_cast<size_t>(st.st_size));
+    ::close(fd);
+    return {true, std::move(data)};
 }
 
-// 优先从内存缓存读取（零 I/O），未命中时回落到磁盘读取。
-// 用于已知必定存在的静态资源（HTML 模板等）。
+// 优先从内存缓存读取，未命中时回落到磁盘。
 static std::string readFile(const std::string &path) {
     auto it = g_staticCache.find(path);
     if (it != g_staticCache.end())
-        return it->second;      // 缓存命中：直接返回，无系统调用
-    return readFileSafe(path).second; // 缓存未命中：降级到磁盘读取
+        return it->second;
+    return readFileSafe(path).second;
 }
-
-
 
 // 文件名安全校验：禁止路径遍历（.. / 绝对路径）
 static bool isSafeFilename(const std::string &name) {
@@ -109,7 +143,6 @@ static std::vector<std::string> listFiles(const std::string &dir) {
         std::string name = entry->d_name;
         if (name == "." || name == "..")
             continue;
-        // 只列出普通文件
         struct stat st{};
         if (stat((dir + "/" + name).c_str(), &st) == 0 && S_ISREG(st.st_mode))
             result.push_back(name);
@@ -145,103 +178,25 @@ static std::string buildFileServerPage() {
     return tpl;
 }
 
-// ── multipart/form-data 解析 ──────────────────────────────────────────────────
-// HTTP 文件上传使用 Content-Type: multipart/form-data; boundary=XXX 格式。
-// 报文体结构：
-//   --BOUNDARY\r\n
-//   Content-Disposition: form-data; name="file"; filename="foo.txt"\r\n
-//   Content-Type: text/plain\r\n
-//   \r\n
-//   <文件内容>
-//   \r\n--BOUNDARY--\r\n
-struct UploadedFile {
-    std::string filename;
-    std::string data;
-};
-
-static std::string extractBoundary(const std::string &contentType) {
-    size_t pos = contentType.find("boundary=");
-    if (pos == std::string::npos)
-        return "";
-    pos += 9; // 跳过 "boundary="
-
-    // RFC 2046 允许带引号 boundary：boundary="----WebKitFormBoundaryXXX"
-    if (pos < contentType.size() && contentType[pos] == '"') {
-        ++pos;
-        size_t end = contentType.find('"', pos);
-        return contentType.substr(pos, end == std::string::npos ? end : end - pos);
-    }
-
-    // 不带引号：到下一个 ';' 或字符串末尾
-    size_t end = contentType.find(';', pos);
-    std::string b = contentType.substr(pos, end == std::string::npos ? end : end - pos);
-    // 修剪尾部可能的空白（某些代理/实现会附加 \r 或空格）
-    while (!b.empty() && (b.back() == ' ' || b.back() == '\t' || b.back() == '\r'))
-        b.pop_back();
-    return b;
-}
-
-static bool parseMultipart(const std::string &body, const std::string &boundary,
-                           UploadedFile &out) {
-    if (boundary.empty())
-        return false;
-    const std::string delim = "--" + boundary;
-
-    // 找到第一个 part 的起始（跳过 boundary 行和 \r\n）
-    size_t partStart = body.find(delim);
-    if (partStart == std::string::npos)
-        return false;
-    partStart += delim.size();
-    if (partStart + 2 <= body.size() && body.substr(partStart, 2) == "\r\n")
-        partStart += 2;
-    else
-        return false;
-
-    // 找到 part headers 结束位置（\r\n\r\n）
-    size_t headersEnd = body.find("\r\n\r\n", partStart);
-    if (headersEnd == std::string::npos)
-        return false;
-
-    std::string headers = body.substr(partStart, headersEnd - partStart);
-
-    // 从 Content-Disposition 中提取 filename
-    size_t fnPos = headers.find("filename=\"");
-    if (fnPos == std::string::npos)
-        return false; // 没有文件字段
-    fnPos += 10;
-    size_t fnEnd = headers.find('"', fnPos);
-    if (fnEnd == std::string::npos)
-        return false;
-    out.filename = headers.substr(fnPos, fnEnd - fnPos);
-
-    // part 内容从 \r\n\r\n 之后到下一个 boundary 之前
-    size_t dataStart = headersEnd + 4;
-    const std::string endMark = "\r\n" + delim;
-    size_t dataEnd = body.find(endMark, dataStart);
-    if (dataEnd == std::string::npos)
-        return false;
-
-    out.data = body.substr(dataStart, dataEnd - dataStart);
-    return !out.filename.empty();
-}
-
 // ── 302 重定向辅助 ─────────────────────────────────────────────────────────────
 static void redirect(HttpResponse *resp, const std::string &location) {
     resp->setStatus(HttpResponse::StatusCode::k302Found, "Found");
     resp->addHeader("Location", location);
     resp->setContentType("text/html; charset=utf-8");
-    // 提供简短的重定向 HTML（部分旧浏览器需要）
     resp->setBody("<html><body>Redirecting to <a href=\"" + location + "\">" + location +
                   "</a></body></html>");
 }
 
-// ── 主路由处理函数 ─────────────────────────────────────────────────────────────
+// ── 业务路由处理函数 ───────────────────────────────────────────────────────────
+//
+// 注意：CORS 预检 / gzip 压缩 / 安全响应头 / ETag-304-Range-sendfile 全部
+// 已经在中间件链与 StaticFileHandler 中实现，这里只关注业务语义。
 static void handleRequest(const HttpRequest &req, HttpResponse *resp) {
     const std::string &url = req.url();
     LOG_INFO << req.methodString() << " " << url;
 
     // ── GET 路由 ───────────────────────────────────────────────────────────────
-    if (req.method() == HttpRequest::Method::kGet) {
+    if (req.method() == HttpRequest::Method::kGet || req.method() == HttpRequest::Method::kHead) {
 
         // 首页
         if (url == "/") {
@@ -261,7 +216,7 @@ static void handleRequest(const HttpRequest &req, HttpResponse *resp) {
             return;
         }
 
-        // 文件管理页（动态生成文件列表）
+        // 文件管理页（动态生成文件列表，不缓存）
         if (url == "/fileserver") {
             std::string body = buildFileServerPage();
             resp->setStatus(HttpResponse::StatusCode::k200OK, "OK");
@@ -271,7 +226,6 @@ static void handleRequest(const HttpRequest &req, HttpResponse *resp) {
         }
 
         // 文件下载：GET /download/<filename>
-        // 用 compare() 替代 substr() 作前缀匹配，避免生成临时字符串对象
         if (url.size() > 10 && url.compare(0, 10, "/download/") == 0) {
             std::string name = HttpRequest::urlDecode(url.substr(10));
             if (!isSafeFilename(name)) {
@@ -279,17 +233,16 @@ static void handleRequest(const HttpRequest &req, HttpResponse *resp) {
                 resp->setBody("Invalid filename\n");
                 return;
             }
-            auto [found, data] = readFileSafe(kFilesDir + "/" + name);
-            if (!found) {
-                // 文件真正不存在：重定向回列表页
-                resp->setRedirect("/fileserver");
-                return;
+            const std::string path = kFilesDir + "/" + name;
+
+            // 调用库级 StaticFileHandler，自动获得 ETag/304/Range/206/sendfile
+            StaticFileHandler::Options opts;
+            opts.downloadName = name;
+            opts.cacheControl = "private, max-age=0, must-revalidate";
+            opts.enableRange = true;
+            if (!StaticFileHandler::serve(req, resp, path, opts)) {
+                redirect(resp, "/fileserver");
             }
-            // 即使 data 为空（0 字节文件）也正常下载，不再错判为"找不到"
-            resp->setStatus(HttpResponse::StatusCode::k200OK, "OK");
-            resp->setContentTypeByFilename(name);
-            resp->addHeader("Content-Disposition", "attachment; filename=\"" + name + "\"");
-            resp->setBody(std::move(data));
             return;
         }
 
@@ -303,20 +256,19 @@ static void handleRequest(const HttpRequest &req, HttpResponse *resp) {
                 else
                     LOG_WARN << "Delete failed: " << name;
             }
-            resp->setRedirect("/fileserver");
+            redirect(resp, "/fileserver");
             return;
         }
 
-        // 其他 GET：尝试作为静态资源服务（/static/xxx → kStaticDir/xxx）
-        // 例如 /login.html 已在上面处理；浏览器可能请求 /favicon.ico 等
+        // 其他 GET：尝试作为静态资源服务
         {
             std::string stripped = HttpRequest::urlDecode(url.substr(1)); // 去掉前导 '/'，并解码
-            if (!stripped.empty() && stripped.find('/') == std::string::npos) {
-                std::string data = readFile(kStaticDir + "/" + stripped);
-                if (!data.empty()) {
-                    resp->setStatus(HttpResponse::StatusCode::k200OK, "OK");
-                    resp->setContentTypeByFilename(stripped);
-                    resp->setBody(std::move(data));
+            if (!stripped.empty() && stripped.find("..") == std::string::npos) {
+                std::string path = kStaticDir + "/" + stripped;
+                StaticFileHandler::Options opts;
+                opts.cacheControl = "public, max-age=60";
+                opts.enableRange = true;
+                if (StaticFileHandler::serve(req, resp, path, opts)) {
                     return;
                 }
             }
@@ -344,7 +296,6 @@ static void handleRequest(const HttpRequest &req, HttpResponse *resp) {
         // POST /login → 解析 application/x-www-form-urlencoded 表单
         if (url == "/login") {
             const std::string &body = req.body();
-            // 简单解析 username=xxx&password=yyy
             auto extract = [&](const std::string &key) -> std::string {
                 size_t pos = body.find(key + "=");
                 if (pos == std::string::npos)
@@ -382,9 +333,6 @@ static void handleRequest(const HttpRequest &req, HttpResponse *resp) {
 
         // POST /upload → multipart/form-data 文件上传
         if (url == "/upload") {
-            std::string contentType = req.header("Content-Type");
-            std::string boundary = extractBoundary(contentType);
-
             HttpRequest::MultipartFile file;
             if (!req.parseMultipart(file) || file.filename.empty()) {
                 LOG_WARN << "Upload failed: bad multipart body";
@@ -393,14 +341,12 @@ static void handleRequest(const HttpRequest &req, HttpResponse *resp) {
                 return;
             }
 
-            // 安全校验文件名
             if (!isSafeFilename(file.filename)) {
                 resp->setStatus(HttpResponse::StatusCode::k400BadRequest, "Bad Request");
                 resp->setBody("Invalid filename\n");
                 return;
             }
 
-            // 写入文件
             std::string savePath = kFilesDir + "/" + file.filename;
             std::ofstream ofs(savePath, std::ios::out | std::ios::binary | std::ios::trunc);
             if (!ofs) {
@@ -415,8 +361,7 @@ static void handleRequest(const HttpRequest &req, HttpResponse *resp) {
 
             LOG_INFO << "Uploaded: " << file.filename << " (" << file.data.size() << " bytes)";
 
-            // 上传后重定向回文件管理页
-            resp->setRedirect("/fileserver");
+            redirect(resp, "/fileserver");
             return;
         }
 
@@ -426,7 +371,7 @@ static void handleRequest(const HttpRequest &req, HttpResponse *resp) {
         return;
     }
 
-    // 其他 HTTP 方法（HEAD/PUT/DELETE 等）暂不支持
+    // 其他 HTTP 方法暂不支持（OPTIONS 已被 CorsMiddleware 拦截）
     resp->setStatus(HttpResponse::StatusCode::k400BadRequest, "Bad Request");
     resp->setBody("Method Not Supported\n");
 }
@@ -434,12 +379,7 @@ static void handleRequest(const HttpRequest &req, HttpResponse *resp) {
 // ─────────────────────────────────────────────────────────────────────────────
 std::unique_ptr<AsyncLogging> g_asyncLog;
 
-void asyncOutputLog(const char* data, int len) {
-    // 追加写入异步日志系统（写内存缓冲区，无锁或极短临界区，不阻塞业务线程）
-    g_asyncLog->append(data, len);
-    // 可选：开发调试阶段如果依然想直接在一边看终端，可以保留一份标准输出写出
-    fwrite(data, 1, len, stdout);
-}
+void asyncOutputLog(const char *data, int len) { g_asyncLog->append(data, len); }
 
 static std::string envOr(const char *key, const std::string &fallback) {
     const char *v = std::getenv(key);
@@ -457,8 +397,7 @@ static int envIntOr(const char *key, int fallback) {
     long parsed = std::strtol(v, &end, 10);
     if (errno != 0 || end == v || *end != '\0')
         return fallback;
-    if (parsed > std::numeric_limits<int>::max() ||
-        parsed < std::numeric_limits<int>::min())
+    if (parsed > std::numeric_limits<int>::max() || parsed < std::numeric_limits<int>::min())
         return fallback;
     return static_cast<int>(parsed);
 }
@@ -504,18 +443,14 @@ static double envDoubleOr(const char *key, double fallback) {
 }
 
 int main() {
-    // 确保存在日志归档目录（以处理“日志文本文档默认散落于build文件夹下”的问题）
     mkdir("log", 0755);
 
-    // 实例化并启动异步日志后端线程
     g_asyncLog = std::make_unique<AsyncLogging>("log/http_server", 50 * 1024 * 1024, 3);
     g_asyncLog->start();
 
-    // 注册到全局 Logger 输出管道，接管程序内所有 LOG_INFO、LOG_ERROR 等宏产生的内容
     Logger::setOutput(asyncOutputLog);
     Logger::setLogLevel(Logger::INFO);
 
-    // 预加载静态文件到内存缓存，消除请求处理路径上的磁盘 I/O
     preloadStaticCache(kStaticDir);
 
     HttpServer::Options options;
@@ -523,10 +458,40 @@ int main() {
     options.tcp.listenPort = envPortOr("MYCPPSERVER_BIND_PORT", 8888);
     options.tcp.ioThreads = envIntOr("MYCPPSERVER_IO_THREADS", 0);
     options.tcp.maxConnections = envSizeOr("MYCPPSERVER_MAX_CONNECTIONS", 10000);
+    options.tcp.tls.enabled = envBoolOr("MYCPPSERVER_TLS_ENABLE", false);
+    options.tcp.tls.certFile = envOr("MYCPPSERVER_TLS_CERT_FILE", "");
+    options.tcp.tls.keyFile = envOr("MYCPPSERVER_TLS_KEY_FILE", "");
     options.autoClose = envBoolOr("MYCPPSERVER_AUTO_CLOSE", false);
     options.idleTimeoutSec = envDoubleOr("MYCPPSERVER_IDLE_TIMEOUT_SEC", 60.0);
+    options.requestTimeoutSec = envDoubleOr("MYCPPSERVER_REQUEST_TIMEOUT_SEC", 15.0);
+    options.limits.maxRequestLineBytes = envIntOr("MYCPPSERVER_MAX_REQUEST_LINE_BYTES", 8 * 1024);
+    options.limits.maxHeaderBytes = envIntOr("MYCPPSERVER_MAX_HEADER_BYTES", 32 * 1024);
+    options.limits.maxBodyBytes = envIntOr("MYCPPSERVER_MAX_BODY_BYTES", 10 * 1024 * 1024);
 
     HttpServer srv(options);
+
+    // ── 中间件链：所有 HTTP 标准行为都来自库级中间件 ───────────────────────────
+    // 1) CORS：跨域响应头 + 预检请求自动 204
+    CorsMiddleware cors;
+    cors.allowOrigin("*")
+        .allowMethods({"GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD"})
+        .allowHeaders(
+            {"Content-Type", "Authorization", "If-None-Match", "If-Modified-Since", "Range"})
+        .maxAge(600);
+    srv.use(cors.toMiddleware());
+
+    // 2) gzip 压缩（可选，需编译时存在 zlib，由 CMake 自动检测）
+    GzipMiddleware gzip;
+    gzip.setMinSize(64);
+    srv.use(gzip.toMiddleware());
+
+    // 3) 通用安全响应头（轻量，不值得抽象成独立类）
+    srv.use([](const HttpRequest &, HttpResponse *resp, const HttpServer::MiddlewareNext &next) {
+        next();
+        resp->addHeader("X-Content-Type-Options", "nosniff");
+        resp->addHeader("Referrer-Policy", "no-referrer");
+    });
+
     srv.setHttpCallback(handleRequest);
 
     Signal::signal(SIGINT, [&] {
@@ -534,24 +499,24 @@ int main() {
         if (fired.test_and_set())
             return;
         std::cout << "\n[http_server] Shutting down.\n";
+        LOG_INFO << "[http_server] Shutting down.";
         srv.stop();
-        g_asyncLog->stop(); // 安全停掉后台日志线程以保证剩余数据被刷写
+        g_asyncLog->stop();
     });
 
-    std::cout << "[http_server] config: listen=" << options.tcp.listenIp << ":"
-              << options.tcp.listenPort
-              << " ioThreads=" << options.tcp.ioThreads
-              << " maxConnections=" << options.tcp.maxConnections
-              << " autoClose=" << (options.autoClose ? "true" : "false")
-              << " idleTimeoutSec=" << options.idleTimeoutSec << "\n"
-              << "[http_server] Listening on http://" << options.tcp.listenIp << ":"
-              << options.tcp.listenPort << "\n"
-              << "  Home:        http://" << options.tcp.listenIp << ":"
-              << options.tcp.listenPort << "/\n"
-              << "  File server: http://" << options.tcp.listenIp << ":"
-              << options.tcp.listenPort << "/fileserver\n"
-              << "  Login:       http://" << options.tcp.listenIp << ":"
-              << options.tcp.listenPort << "/login.html\n";
+    LOG_INFO << "[http_server] config: listen=" << options.tcp.listenIp << ":"
+             << options.tcp.listenPort << " ioThreads=" << options.tcp.ioThreads
+             << " maxConnections=" << options.tcp.maxConnections
+             << " autoClose=" << (options.autoClose ? "true" : "false")
+             << " idleTimeoutSec=" << options.idleTimeoutSec;
+    LOG_INFO << "[http_server] Listening on http://" << options.tcp.listenIp << ":"
+             << options.tcp.listenPort;
+    LOG_INFO << "  Home:        http://" << options.tcp.listenIp << ":" << options.tcp.listenPort
+             << "/";
+    LOG_INFO << "  File server: http://" << options.tcp.listenIp << ":" << options.tcp.listenPort
+             << "/fileserver";
+    LOG_INFO << "  Login:       http://" << options.tcp.listenIp << ":" << options.tcp.listenPort
+             << "/login.html";
 
     srv.start();
     return 0;

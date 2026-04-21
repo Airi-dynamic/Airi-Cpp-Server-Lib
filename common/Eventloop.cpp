@@ -2,8 +2,9 @@
 #include "Channel.h"
 #include "Poller/Poller.h"
 #include "log/Logger.h"
-#include "timer/TimerQueue.h"
 #include "timer/TimeStamp.h"
+#include "timer/TimerQueue.h"
+
 
 #include <cerrno>
 #include <cstring>
@@ -30,16 +31,14 @@ Eventloop::Eventloop() : poller_(nullptr), quit_(false), tid_(std::this_thread::
 #ifdef __linux__
     evtfd_ = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     if (evtfd_ == -1) {
-        LOG_ERROR << "[Eventloop] eventfd 创建失败，错误=" << strerror(errno)
-                  << " errno=" << errno;
+        LOG_ERROR << "[Eventloop] eventfd 创建失败，错误=" << strerror(errno) << " errno=" << errno;
         throw std::runtime_error("eventfd create failed");
     }
     evtChannel_ = std::make_unique<Channel>(this, evtfd_);
 #elif defined(__APPLE__)
     int pipeFds[2];
     if (pipe(pipeFds) == -1) {
-        LOG_ERROR << "[Eventloop] pipe 创建失败，错误=" << strerror(errno)
-                  << " errno=" << errno;
+        LOG_ERROR << "[Eventloop] pipe 创建失败，错误=" << strerror(errno) << " errno=" << errno;
         throw std::runtime_error("pipe create failed");
     }
     wakeupReadFd_ = pipeFds[0];
@@ -127,8 +126,7 @@ void Eventloop::wakeup() {
             continue;
         if (n == -1 && (errno == EAGAIN || errno == EWOULDBLOCK))
             return;
-        LOG_WARN << "[Eventloop] wakeup 写入失败，错误=" << strerror(errno)
-                 << " errno=" << errno;
+        LOG_WARN << "[Eventloop] wakeup 写入失败，错误=" << strerror(errno) << " errno=" << errno;
         return;
     }
 #elif defined(__APPLE__)
@@ -143,8 +141,7 @@ void Eventloop::wakeup() {
             continue;
         if (n == -1 && (errno == EAGAIN || errno == EWOULDBLOCK))
             return;
-        LOG_WARN << "[Eventloop] wakeup 写入失败，错误=" << strerror(errno)
-                 << " errno=" << errno;
+        LOG_WARN << "[Eventloop] wakeup 写入失败，错误=" << strerror(errno) << " errno=" << errno;
         return;
     }
 #endif
@@ -213,7 +210,7 @@ void Eventloop::runAfter(double seconds, std::function<void()> cb) {
 
 void Eventloop::runEvery(double seconds, std::function<void()> cb) {
     runInLoop([this, seconds, cb = std::move(cb)]() mutable {
-        timerQueue_->addTimer(TimeStamp::addSeconds(TimeStamp::now(), seconds),
-                              std::move(cb), seconds);
+        timerQueue_->addTimer(TimeStamp::addSeconds(TimeStamp::now(), seconds), std::move(cb),
+                              seconds);
     });
 }

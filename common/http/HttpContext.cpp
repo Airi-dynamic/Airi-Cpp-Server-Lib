@@ -2,7 +2,9 @@
 #include <cctype>
 #include <cstdlib>
 
-HttpContext::HttpContext() = default;
+HttpContext::HttpContext() : HttpContext(Limits{}) {}
+
+HttpContext::HttpContext(const Limits &limits) : limits_(limits) {}
 
 void HttpContext::reset() {
     state_ = State::kStart;
@@ -10,6 +12,9 @@ void HttpContext::reset() {
     tokenBuf_.clear();
     colonBuf_.clear();
     bodyLen_ = 0;
+    requestLineBytes_ = 0;
+    headerBytes_ = 0;
+    payloadTooLarge_ = false;
 }
 
 // ── 有限状态机核心 ──────────────────────────────────────────────────────────
@@ -42,6 +47,12 @@ bool HttpContext::parse(const char *data, int len, int *consumedBytes) {
 
         // ── 方法名：纯大写字母，空格结束 ─────────────────────────────────────
         case State::kMethod:
+            ++requestLineBytes_;
+            if (requestLineBytes_ > limits_.maxRequestLineBytes) {
+                payloadTooLarge_ = true;
+                state_ = State::kInvalid;
+                break;
+            }
             if (std::isupper(ch)) {
                 tokenBuf_ += ch;
             } else if (std::isblank(ch)) {
@@ -58,6 +69,12 @@ bool HttpContext::parse(const char *data, int len, int *consumedBytes) {
 
         // ── 方法后的空格到 '/' ───────────────────────────────────────────────
         case State::kBeforeUrl:
+            ++requestLineBytes_;
+            if (requestLineBytes_ > limits_.maxRequestLineBytes) {
+                payloadTooLarge_ = true;
+                state_ = State::kInvalid;
+                break;
+            }
             if (ch == '/') {
                 tokenBuf_ += ch;
                 state_ = State::kUrl;
@@ -70,6 +87,12 @@ bool HttpContext::parse(const char *data, int len, int *consumedBytes) {
 
         // ── 路径：遇到 '?' 转查询参数，遇到空格结束 ─────────────────────────
         case State::kUrl:
+            ++requestLineBytes_;
+            if (requestLineBytes_ > limits_.maxRequestLineBytes) {
+                payloadTooLarge_ = true;
+                state_ = State::kInvalid;
+                break;
+            }
             if (ch == '?') {
                 request_.setUrl(tokenBuf_);
                 tokenBuf_.clear();
@@ -85,6 +108,12 @@ bool HttpContext::parse(const char *data, int len, int *consumedBytes) {
 
         // ── URL 查询参数键（key=value&key2=value2）────────────────────────────
         case State::kQueryKey:
+            ++requestLineBytes_;
+            if (requestLineBytes_ > limits_.maxRequestLineBytes) {
+                payloadTooLarge_ = true;
+                state_ = State::kInvalid;
+                break;
+            }
             if (ch == '=') {
                 colonBuf_ = tokenBuf_; // 暂存 key
                 tokenBuf_.clear();
@@ -97,6 +126,12 @@ bool HttpContext::parse(const char *data, int len, int *consumedBytes) {
             break;
 
         case State::kQueryValue:
+            ++requestLineBytes_;
+            if (requestLineBytes_ > limits_.maxRequestLineBytes) {
+                payloadTooLarge_ = true;
+                state_ = State::kInvalid;
+                break;
+            }
             if (ch == '&') {
                 request_.addQueryParam(colonBuf_, tokenBuf_);
                 colonBuf_.clear();
@@ -114,6 +149,12 @@ bool HttpContext::parse(const char *data, int len, int *consumedBytes) {
 
         // ── 协议名（"HTTP"）──────────────────────────────────────────────────
         case State::kBeforeProtocol:
+            ++requestLineBytes_;
+            if (requestLineBytes_ > limits_.maxRequestLineBytes) {
+                payloadTooLarge_ = true;
+                state_ = State::kInvalid;
+                break;
+            }
             if (std::isblank(ch)) {
                 // 跳过空格
             } else if (std::isupper(ch)) {
@@ -125,6 +166,12 @@ bool HttpContext::parse(const char *data, int len, int *consumedBytes) {
             break;
 
         case State::kProtocol:
+            ++requestLineBytes_;
+            if (requestLineBytes_ > limits_.maxRequestLineBytes) {
+                payloadTooLarge_ = true;
+                state_ = State::kInvalid;
+                break;
+            }
             if (ch == '/') {
                 // "HTTP" 后跟 '/'，进入版本解析
                 tokenBuf_.clear();
@@ -138,6 +185,12 @@ bool HttpContext::parse(const char *data, int len, int *consumedBytes) {
 
         // ── 版本号（"1.0" / "1.1"），\r 结束请求行 ───────────────────────────
         case State::kBeforeVersion:
+            ++requestLineBytes_;
+            if (requestLineBytes_ > limits_.maxRequestLineBytes) {
+                payloadTooLarge_ = true;
+                state_ = State::kInvalid;
+                break;
+            }
             if (std::isdigit(ch)) {
                 tokenBuf_ += ch;
                 state_ = State::kVersion;
@@ -147,6 +200,12 @@ bool HttpContext::parse(const char *data, int len, int *consumedBytes) {
             break;
 
         case State::kVersion:
+            ++requestLineBytes_;
+            if (requestLineBytes_ > limits_.maxRequestLineBytes) {
+                payloadTooLarge_ = true;
+                state_ = State::kInvalid;
+                break;
+            }
             if (ch == '\r') {
                 request_.setVersion(tokenBuf_);
                 tokenBuf_.clear();
@@ -163,6 +222,12 @@ bool HttpContext::parse(const char *data, int len, int *consumedBytes) {
 
         // ── 请求头字段名（跳过 \n；空行 \r\n → 进入 body 判断）──────────────
         case State::kHeaderKey:
+            ++headerBytes_;
+            if (headerBytes_ > limits_.maxHeaderBytes) {
+                payloadTooLarge_ = true;
+                state_ = State::kInvalid;
+                break;
+            }
             if (ch == '\n') {
                 // 跳过行末的 \n（上一行的 \r 已被消耗，这里消耗对应的 \n）
             } else if (ch == '\r') {
@@ -170,11 +235,17 @@ bool HttpContext::parse(const char *data, int len, int *consumedBytes) {
                 if (tokenBuf_.empty()) {
                     ++p; // 跳过 '\r'
                     // 消耗空行的 '\n'，确保 p 指向 body 的第一个字节
-                    if (p < end && *p == '\n') ++p;
+                    if (p < end && *p == '\n')
+                        ++p;
                     // 性能优化：Content-Length 只在此处查找一次并缓存到 bodyLen_，
                     // 后续 kBody 重入时直接使用成员变量，无需再查 unordered_map
                     const std::string &cl = request_.header("Content-Length");
                     bodyLen_ = cl.empty() ? 0 : std::atoi(cl.c_str());
+                    if (bodyLen_ < 0 || bodyLen_ > limits_.maxBodyBytes) {
+                        payloadTooLarge_ = true;
+                        state_ = State::kInvalid;
+                        continue;
+                    }
                     if (bodyLen_ > 0) {
                         state_ = State::kBody;
                     } else {
@@ -195,6 +266,12 @@ bool HttpContext::parse(const char *data, int len, int *consumedBytes) {
 
         // ── 请求头字段值（跳过冒号后空格，\r 结束）──────────────────────────
         case State::kHeaderValue:
+            ++headerBytes_;
+            if (headerBytes_ > limits_.maxHeaderBytes) {
+                payloadTooLarge_ = true;
+                state_ = State::kInvalid;
+                break;
+            }
             if (tokenBuf_.empty() && std::isblank(ch)) {
                 // 跳过 ": " 后的前导空格
             } else if (ch == '\r') {
@@ -218,6 +295,11 @@ bool HttpContext::parse(const char *data, int len, int *consumedBytes) {
             int alreadyRead = static_cast<int>(request_.body().size());
             int remaining = static_cast<int>(end - p);
             int toRead = std::min(bodyLen_ - alreadyRead, remaining);
+            if (alreadyRead + toRead > limits_.maxBodyBytes) {
+                payloadTooLarge_ = true;
+                state_ = State::kInvalid;
+                break;
+            }
             if (toRead > 0) {
                 request_.appendBody(p, toRead); // O(1) 均摊，无副本
                 p += toRead;

@@ -7,8 +7,21 @@
 
 #include <algorithm>
 #include <functional>
+#include <stdexcept>
 #include <thread>
 #include <unistd.h>
+
+#ifdef MCPP_HAS_OPENSSL
+#include <openssl/err.h>
+#include <openssl/ssl.h>
+#endif
+
+#ifdef MCPP_HAS_OPENSSL
+void TcpServer::SslCtxDeleter::operator()(SSL_CTX *ctx) const {
+    if (ctx)
+        SSL_CTX_free(ctx);
+}
+#endif
 
 int TcpServer::normalizeIoThreadCount(int configured, unsigned int hardwareCount) {
     if (configured > 0)
@@ -23,23 +36,84 @@ TcpServer::TcpServer() : TcpServer(Options{}) {}
 TcpServer::TcpServer(const Options &options) : options_(options) {
     mainReactor_ = std::make_unique<Eventloop>();
 
-    acceptor_ = std::make_unique<Acceptor>(
-        mainReactor_.get(), options_.listenIp.c_str(), options_.listenPort);
+    acceptor_ = std::make_unique<Acceptor>(mainReactor_.get(), options_.listenIp.c_str(),
+                                           options_.listenPort);
     acceptor_->setNewConnectionCallback(
         std::bind(&TcpServer::newConnection, this, std::placeholders::_1));
 
-    int threadNum = normalizeIoThreadCount(options_.ioThreads,
-                                           std::thread::hardware_concurrency());
+    int threadNum = normalizeIoThreadCount(options_.ioThreads, std::thread::hardware_concurrency());
     threadPool_ = std::make_unique<EventLoopThreadPool>(mainReactor_.get());
     threadPool_->setThreadNums(threadNum);
 
     if (options_.maxConnections > 0)
         maxConnections_ = options_.maxConnections;
 
+    if (!initTlsIfNeeded()) {
+        throw std::runtime_error("tcp server tls init failed");
+    }
+
     LOG_INFO << "[TcpServer] Main Reactor + " << threadNum
-             << " Sub Reactors ready. listen=" << options_.listenIp
-             << ":" << options_.listenPort
-             << " maxConnections=" << maxConnections_;
+             << " Sub Reactors ready. listen=" << options_.listenIp << ":" << options_.listenPort
+             << " maxConnections=" << maxConnections_ << " tls=" << (tlsEnabled_ ? "on" : "off");
+}
+
+bool TcpServer::initTlsIfNeeded() {
+    if (!options_.tls.enabled) {
+        tlsEnabled_ = false;
+        return true;
+    }
+
+#ifndef MCPP_HAS_OPENSSL
+    LOG_ERROR << "[TcpServer] TLS 已启用但当前构建未启用 OpenSSL（MCPP_HAS_OPENSSL）";
+    return false;
+#else
+    if (options_.tls.certFile.empty() || options_.tls.keyFile.empty()) {
+        LOG_ERROR << "[TcpServer] TLS 已启用但证书/私钥路径为空";
+        return false;
+    }
+
+    SSL_load_error_strings();
+    OpenSSL_add_ssl_algorithms();
+
+    SSL_CTX *rawCtx = SSL_CTX_new(TLS_server_method());
+    if (!rawCtx) {
+        LOG_ERROR << "[TcpServer] SSL_CTX_new 失败";
+        return false;
+    }
+
+    SSL_CTX_set_mode(rawCtx, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+    SSL_CTX_set_min_proto_version(rawCtx, TLS1_2_VERSION);
+
+    if (SSL_CTX_use_certificate_file(rawCtx, options_.tls.certFile.c_str(), SSL_FILETYPE_PEM) !=
+        1) {
+        unsigned long err = ERR_get_error();
+        LOG_ERROR << "[TcpServer] 加载 TLS 证书失败: " << options_.tls.certFile
+                  << " err=" << ERR_error_string(err, nullptr);
+        SSL_CTX_free(rawCtx);
+        return false;
+    }
+
+    if (SSL_CTX_use_PrivateKey_file(rawCtx, options_.tls.keyFile.c_str(), SSL_FILETYPE_PEM) != 1) {
+        unsigned long err = ERR_get_error();
+        LOG_ERROR << "[TcpServer] 加载 TLS 私钥失败: " << options_.tls.keyFile
+                  << " err=" << ERR_error_string(err, nullptr);
+        SSL_CTX_free(rawCtx);
+        return false;
+    }
+
+    if (SSL_CTX_check_private_key(rawCtx) != 1) {
+        unsigned long err = ERR_get_error();
+        LOG_ERROR << "[TcpServer] TLS 私钥与证书不匹配"
+                  << " err=" << ERR_error_string(err, nullptr);
+        SSL_CTX_free(rawCtx);
+        return false;
+    }
+
+    tlsCtx_.reset(rawCtx);
+    tlsEnabled_ = true;
+    LOG_INFO << "[TcpServer] TLS 已启用 cert=" << options_.tls.certFile;
+    return true;
+#endif
 }
 
 void TcpServer::setMaxConnections(size_t maxConnections) {
@@ -73,8 +147,7 @@ void TcpServer::newConnection(int fd) {
 
     if (shouldRejectNewConnection(connections_.size(), maxConnections_)) {
         LOG_WARN << "[TcpServer] 连接数达到上限，拒绝新连接 fd=" << fd
-                 << " current=" << connections_.size()
-                 << " max=" << maxConnections_;
+                 << " current=" << connections_.size() << " max=" << maxConnections_;
         ::close(fd);
         return;
     }
@@ -82,6 +155,15 @@ void TcpServer::newConnection(int fd) {
     // 轮询选择一个 sub-reactor 归属这条连接
     Eventloop *subLoop = threadPool_->nextLoop();
     auto conn = std::make_unique<Connection>(fd, subLoop);
+
+#ifdef MCPP_HAS_OPENSSL
+    if (tlsEnabled_) {
+        if (!conn->enableTlsServer(tlsCtx_.get())) {
+            LOG_ERROR << "[TcpServer] 连接 TLS 初始化失败，关闭 fd=" << fd;
+            return;
+        }
+    }
+#endif
 
     // 先注入所有回调，再通过 queueInLoop 在归属 sub-reactor 线程启用 Channel，
     // 避免 Channel 就绪触发事件时回调尚未设置

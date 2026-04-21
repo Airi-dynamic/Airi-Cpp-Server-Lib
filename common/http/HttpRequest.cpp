@@ -1,5 +1,8 @@
 #include "http/HttpRequest.h"
 
+#include <algorithm>
+#include <cctype>
+
 HttpRequest::HttpRequest() = default;
 
 bool HttpRequest::setMethod(const std::string &m) {
@@ -8,6 +11,7 @@ bool HttpRequest::setMethod(const std::string &m) {
     if (m == "HEAD")        { method_ = Method::kHead;   return true; }
     if (m == "PUT")         { method_ = Method::kPut;    return true; }
     if (m == "DELETE")      { method_ = Method::kDelete; return true; }
+    if (m == "OPTIONS")     { method_ = Method::kOptions; return true; }
     method_ = Method::kInvalid;
     return false;
 }
@@ -19,6 +23,7 @@ std::string HttpRequest::methodString() const {
     case Method::kHead:   return "HEAD";
     case Method::kPut:    return "PUT";
     case Method::kDelete: return "DELETE";
+    case Method::kOptions:return "OPTIONS";
     default:              return "INVALID";
     }
 }
@@ -47,12 +52,20 @@ std::string HttpRequest::queryParam(const std::string &key) const {
 }
 
 void HttpRequest::addHeader(const std::string &key, const std::string &value) {
-    headers_[key] = value;
+    headers_[normalizeHeaderKey(key)] = value;
 }
 
 std::string HttpRequest::header(const std::string &key) const {
-    auto it = headers_.find(key);
+    auto it = headers_.find(normalizeHeaderKey(key));
     return it != headers_.end() ? it->second : "";
+}
+
+std::string HttpRequest::normalizeHeaderKey(const std::string &key) {
+    std::string normalized;
+    normalized.reserve(key.size());
+    for (char c : key)
+        normalized.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    return normalized;
 }
 
 void HttpRequest::reset() {

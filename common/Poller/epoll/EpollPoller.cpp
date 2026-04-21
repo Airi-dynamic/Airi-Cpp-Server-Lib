@@ -31,8 +31,7 @@ const char *epollOpName(int op) {
 
 } // namespace
 
-EpollPoller::EpollPoller(Eventloop *loop)
-    : Poller(loop), epollFd_(-1), events_(kInitialEvents) {
+EpollPoller::EpollPoller(Eventloop *loop) : Poller(loop), epollFd_(-1), events_(kInitialEvents) {
     epollFd_ = epoll_create1(0);
     if (epollFd_ == -1) {
         LOG_FATAL << "epoll create error, errno=" << errno << " 错误=" << strerror(errno);
@@ -66,7 +65,7 @@ void EpollPoller::updateChannel(Channel *channel) {
     if (!channel->getInEpoll() && channel->getListenEvents() == 0)
         return;
 
-    struct epoll_event ev{};
+    struct epoll_event ev {};
     ev.data.ptr = channel;
 
     // 原本的 ev.events = channel->getEvents(); 需要在 channel 类全局引入 linux 上的 sys/epoll.h
@@ -82,8 +81,7 @@ void EpollPoller::updateChannel(Channel *channel) {
         op = EPOLL_CTL_DEL;
 
     auto runCtl = [&](int ctlOp) {
-        return epoll_ctl(epollFd_, ctlOp, fd,
-                         ctlOp == EPOLL_CTL_DEL ? nullptr : &ev);
+        return epoll_ctl(epollFd_, ctlOp, fd, ctlOp == EPOLL_CTL_DEL ? nullptr : &ev);
     };
 
     if (runCtl(op) == 0) {
@@ -121,15 +119,13 @@ void EpollPoller::updateChannel(Channel *channel) {
 
     if (shouldIgnoreCtlError(op, firstErr)) {
         channel->setInEpoll(false);
-        LOG_WARN << "[EpollPoller] 忽略可恢复错误 op=" << epollOpName(op)
-                 << " fd=" << fd << " 错误=" << strerror(firstErr)
-                 << "(" << firstErr << ")";
+        LOG_WARN << "[EpollPoller] 忽略可恢复错误 op=" << epollOpName(op) << " fd=" << fd
+                 << " 错误=" << strerror(firstErr) << "(" << firstErr << ")";
         return;
     }
 
-    LOG_ERROR << "[EpollPoller] epoll_ctl " << epollOpName(op)
-              << " 失败，fd=" << fd << " 错误=" << strerror(firstErr)
-              << "(" << firstErr << ")";
+    LOG_ERROR << "[EpollPoller] epoll_ctl " << epollOpName(op) << " 失败，fd=" << fd
+              << " 错误=" << strerror(firstErr) << "(" << firstErr << ")";
     if (op == EPOLL_CTL_DEL)
         channel->setInEpoll(false);
 }
@@ -143,8 +139,8 @@ void EpollPoller::deleteChannel(Channel *channel) {
     if (epoll_ctl(epollFd_, EPOLL_CTL_DEL, fd, nullptr) == -1) {
         const int err = errno;
         if (!shouldIgnoreCtlError(EPOLL_CTL_DEL, err)) {
-            LOG_ERROR << "[EpollPoller] deleteChannel 失败，fd=" << fd
-                      << " 错误=" << strerror(err) << "(" << err << ")";
+            LOG_ERROR << "[EpollPoller] deleteChannel 失败，fd=" << fd << " 错误=" << strerror(err)
+                      << "(" << err << ")";
         } else {
             LOG_WARN << "[EpollPoller] deleteChannel 忽略可恢复错误，fd=" << fd
                      << " 错误=" << strerror(err) << "(" << err << ")";
@@ -155,12 +151,11 @@ void EpollPoller::deleteChannel(Channel *channel) {
 
 std::vector<Channel *> EpollPoller::poll(int timeout) {
     std::vector<Channel *> activeChannels;
-    int nfds = epoll_wait(epollFd_, events_.data(), static_cast<int>(events_.size()),
-                          timeout);
+    int nfds = epoll_wait(epollFd_, events_.data(), static_cast<int>(events_.size()), timeout);
     if (nfds == -1) {
         if (errno != EINTR) {
-            LOG_ERROR << "[EpollPoller] epoll_wait 失败，错误=" << strerror(errno)
-                      << "(" << errno << ")";
+            LOG_ERROR << "[EpollPoller] epoll_wait 失败，错误=" << strerror(errno) << "(" << errno
+                      << ")";
         }
         return activeChannels;
     }

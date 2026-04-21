@@ -8,6 +8,14 @@
 #include <cstddef>
 #include <functional>
 #include <memory>
+#include <string>
+
+#ifdef MCPP_HAS_OPENSSL
+struct ssl_st;
+using SSL = ssl_st;
+struct ssl_ctx_st;
+using SSL_CTX = ssl_ctx_st;
+#endif
 
 class Eventloop;
 class Buffer;
@@ -28,15 +36,15 @@ class Connection {
     // - buffered <= low      -> 恢复读事件
     // - buffered > hardLimit -> 触发保护性断连，防止内存失控
     struct BackpressureConfig {
-      size_t lowWatermarkBytes{4 * 1024 * 1024};
-      size_t highWatermarkBytes{16 * 1024 * 1024};
-      size_t hardLimitBytes{64 * 1024 * 1024};
+        size_t lowWatermarkBytes{4 * 1024 * 1024};
+        size_t highWatermarkBytes{16 * 1024 * 1024};
+        size_t hardLimitBytes{64 * 1024 * 1024};
     };
 
     struct BackpressureDecision {
-      bool shouldPauseRead{false};
-      bool shouldResumeRead{false};
-      bool shouldCloseConnection{false};
+        bool shouldPauseRead{false};
+        bool shouldResumeRead{false};
+        bool shouldCloseConnection{false};
     };
 
     // 构造参数改为 int fd，Socket 在内部创建
@@ -49,14 +57,22 @@ class Connection {
     bool isReadPausedByBackpressure() const { return readPausedByBackpressure_; }
 
     static bool isValidBackpressureConfig(const BackpressureConfig &cfg);
-    static BackpressureDecision evaluateBackpressure(size_t bufferedBytes,
-                             bool readPaused,
-                             const BackpressureConfig &cfg);
+    static BackpressureDecision evaluateBackpressure(size_t bufferedBytes, bool readPaused,
+                                                     const BackpressureConfig &cfg);
+
+#ifdef MCPP_HAS_OPENSSL
+    // 启用 TLS 服务端模式，后续读写自动经 SSL_* 接口收发。
+    bool enableTlsServer(SSL_CTX *ctx);
+#endif
+    bool tlsEnabled() const;
 
     void send(const std::string &msg);
     // 移动重载：当调用方持有临时字符串（如 resp.serialize() 的返回值）时，
     // 避免一次额外的字符串拷贝。热路径：HttpServer::onRequest() → conn->send(resp.serialize())
     void send(std::string &&msg);
+
+    // 文件正文发送快路径：优先尝试 sendfile，不可用时降级为分块读取后发送。
+    bool sendFile(const std::string &path, size_t offset, size_t count);
 
     void setOnMessageCallback(std::function<void(Connection *)> const &cb);
     // deleteCallback 改为 void(int fd)
@@ -83,8 +99,7 @@ class Connection {
     // TCP 层对类型一无所知，上层用 std::any_cast<T> 取出。
     void setContext(std::any ctx) { context_ = std::move(ctx); }
     std::any &getContext() { return context_; }
-    template <typename T>
-    T *getContextAs() { return std::any_cast<T>(&context_); }
+    template <typename T> T *getContextAs() { return std::any_cast<T>(&context_); }
 
     // ── 空闲超时支持 ─────────────────────────────────────────────────────────
     // alive_：shared_ptr<bool> 作为"存活标志"，Connection 析构时置 false。
@@ -123,4 +138,20 @@ class Connection {
 
     void applyBackpressureAfterAppend();
     void tryResumeReadAfterDrain();
+
+#ifdef MCPP_HAS_OPENSSL
+    enum class TlsState {
+        kDisabled = 0,
+        kHandshaking,
+        kEstablished,
+        kFailed,
+    };
+
+    ssize_t readFromTransport(char *buf, size_t len, int *savedErrno);
+    ssize_t writeToTransport(const char *buf, size_t len, int *savedErrno);
+    bool driveTlsHandshake();
+
+    SSL *ssl_{nullptr};
+    TlsState tlsState_{TlsState::kDisabled};
+#endif
 };

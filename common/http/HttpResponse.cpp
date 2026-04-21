@@ -13,12 +13,38 @@ void HttpResponse::addHeader(const std::string &key, const std::string &value) {
     headers_[key] = value;
 }
 
+std::string HttpResponse::header(const std::string &key) const {
+    auto it = headers_.find(key);
+    return it == headers_.end() ? "" : it->second;
+}
+
 void HttpResponse::setContentType(const std::string &contentType) {
     addHeader("Content-Type", contentType);
 }
 
-void HttpResponse::setBody(const std::string &body) { body_ = body; }
-void HttpResponse::setBody(std::string &&body) { body_ = std::move(body); }
+void HttpResponse::setBody(const std::string &body) {
+    clearSendFile();
+    body_ = body;
+}
+void HttpResponse::setBody(std::string &&body) {
+    clearSendFile();
+    body_ = std::move(body);
+}
+
+void HttpResponse::setSendFile(const std::string &path, size_t offset, size_t count) {
+    useSendFile_ = true;
+    sendFilePath_ = path;
+    sendFileOffset_ = offset;
+    sendFileCount_ = count;
+    body_.clear();
+}
+
+void HttpResponse::clearSendFile() {
+    useSendFile_ = false;
+    sendFilePath_.clear();
+    sendFileOffset_ = 0;
+    sendFileCount_ = 0;
+}
 
 // 序列化：组装状态行 + 固定头部 + 用户头部 + 空行 + body
 std::string HttpResponse::serialize() const {
@@ -34,7 +60,11 @@ std::string HttpResponse::serialize() const {
 
     // Content-Length 始终包含，让客户端无需等待 TCP 关闭就能确定响应体结束
     result += "Content-Length: ";
-    result += std::to_string(body_.size());
+    if (useSendFile_) {
+        result += std::to_string(sendFileCount_);
+    } else {
+        result += std::to_string(body_.size());
+    }
     result += "\r\n";
 
     // 连接控制头
@@ -56,7 +86,8 @@ std::string HttpResponse::serialize() const {
     result += "\r\n";
 
     // Body
-    result += body_;
+    if (!useSendFile_)
+        result += body_;
 
     return result;
 }
@@ -99,5 +130,6 @@ void HttpResponse::setRedirect(const std::string &location) {
     setStatus(StatusCode::k302Found, "Found");
     addHeader("Location", location);
     setContentType("text/html; charset=utf-8");
+    clearSendFile();
     setBody("<html><body>Redirecting to <a href=\"" + location + "\">" + location + "</a></body></html>");
 }

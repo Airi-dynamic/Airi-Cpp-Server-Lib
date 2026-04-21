@@ -6,7 +6,7 @@
 // 由 HttpContext 状态机填充，用户通过只读接口访问。
 class HttpRequest {
   public:
-    enum class Method { kInvalid = 0, kGet, kPost, kHead, kPut, kDelete };
+    enum class Method { kInvalid = 0, kGet, kPost, kHead, kPut, kDelete, kOptions };
     enum class Version { kUnknown = 0, kHttp10, kHttp11 };
 
     HttpRequest();
@@ -52,6 +52,8 @@ class HttpRequest {
     bool parseMultipart(MultipartFile &out) const;
 
   private:
+    static std::string normalizeHeaderKey(const std::string &key);
+
     Method method_{Method::kInvalid};
     Version version_{Version::kUnknown};
     std::string url_;

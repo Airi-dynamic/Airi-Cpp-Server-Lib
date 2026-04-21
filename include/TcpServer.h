@@ -7,6 +7,11 @@
 #include <string>
 #include <unordered_map>
 
+#ifdef MCPP_HAS_OPENSSL
+struct ssl_ctx_st;
+using SSL_CTX = ssl_ctx_st;
+#endif
+
 class Connection;
 class Eventloop;
 class Acceptor;
@@ -15,15 +20,19 @@ class EventLoopThreadPool;
 class TcpServer {
     DISALLOW_COPY_AND_MOVE(TcpServer)
   public:
-    // ── Day 28：服务器配置参数集（Phase 3）─────────────────────────────────
-    // 之前版本通过环境变量 / 全局常量配置，难以在测试中固定。把所有可调参数
-    // 收敛到 Options 后，应用层可以通过 `TcpServer(Options{...})` 一次性注入，
-    // 单元测试也可以构造任意组合而不依赖外部状态。
     struct Options {
         std::string listenIp{"127.0.0.1"};
         uint16_t listenPort{8888};
-        int ioThreads{0};             // <=0 表示按 hardware_concurrency 自动选择
-        size_t maxConnections{10000}; // 最大并发连接数；超出即关闭新 fd
+        int ioThreads{0}; // <=0 表示按 hardware_concurrency 自动选择
+        size_t maxConnections{10000};
+
+        struct TlsOptions {
+            bool enabled{false};
+            std::string certFile;
+            std::string keyFile;
+        };
+
+        TlsOptions tls;
     };
 
   private:
@@ -47,9 +56,20 @@ class TcpServer {
     std::unique_ptr<EventLoopThreadPool> threadPool_;
     std::unordered_map<int, std::unique_ptr<Connection>> connections_;
     size_t maxConnections_{10000};
+    bool tlsEnabled_{false};
+
+#ifdef MCPP_HAS_OPENSSL
+    struct SslCtxDeleter {
+        void operator()(SSL_CTX *ctx) const;
+    };
+
+    std::unique_ptr<SSL_CTX, SslCtxDeleter> tlsCtx_{nullptr};
+#endif
 
     std::function<void(Connection *)> onMessageCallback_;
     std::function<void(Connection *)> newConnectCallback_;
+
+    bool initTlsIfNeeded();
 
   public:
     TcpServer();
@@ -60,15 +80,10 @@ class TcpServer {
     void setMaxConnections(size_t maxConnections);
     size_t maxConnections() const { return maxConnections_; }
     size_t connectionCount() const { return connections_.size(); }
+    bool tlsEnabled() const { return tlsEnabled_; }
 
-    // ── Day 28：纯策略函数（Phase 3）──────────────────────────────────────
-    // 这两个 static 函数零副作用、无 I/O，把"是否拒绝新连接""应起多少 IO
-    // 线程"两个决策从 TcpServer 的执行路径中剥离出来。这样：
-    //   1) handleNewConnection() 只需调用 shouldRejectNewConnection() 即可；
-    //   2) 单元测试只需要传入数字即可枚举所有边界（参见
-    //      test/TcpServerPolicyTest.cpp）。
+    // 纯策略函数：便于单元测试，不依赖网络环境。
     static bool shouldRejectNewConnection(size_t currentCount, size_t maxConnections);
-    // configured<=0 时按 hardware_concurrency 取值；硬件返回 0（容器 / 沙箱）则保底 1。
     static int normalizeIoThreadCount(int configured, unsigned int hardwareCount);
 
     void Start(); // 启动所有 sub-reactor 线程和 main-reactor 循环

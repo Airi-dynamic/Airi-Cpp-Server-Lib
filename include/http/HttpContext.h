@@ -18,6 +18,12 @@
 
 class HttpContext {
   public:
+    struct Limits {
+        int maxRequestLineBytes{8 * 1024};
+        int maxHeaderBytes{32 * 1024};
+        int maxBodyBytes{10 * 1024 * 1024};
+    };
+
     enum class State {
         kInvalid,        // 解析出错，后续数据将被忽略
         kStart,          // 报文开始
@@ -37,15 +43,14 @@ class HttpContext {
     };
 
     HttpContext();
+    explicit HttpContext(const Limits &limits);
+
+    void setLimits(const Limits &limits) { limits_ = limits; }
+    const Limits &limits() const { return limits_; }
 
     // 将 data[0..len) 喂入状态机，返回 false 表示报文格式非法。
     // 可多次调用；每次调用都从上次中断的状态继续。
-    //
-    // ── Day 28：HTTP pipeline 支持（Phase 3）──────────────────────────────
-    // consumedBytes 输出本次实际消费的字节数。当客户端在同一 TCP 包中发
-    // 送多个请求（HTTP/1.1 pipelining）时，HttpServer::onMessage 需要
-    // 知道：第一条请求结束后，buffer 里还剩多少字节属于第二条。
-    // Day27 之前 parse() 一次只能解析一条请求，剩余字节会被错误地丢弃。
+    // consumedBytes 输出本次实际消费的字节数（用于上层保留同包中的后续请求字节）。
     bool parse(const char *data, int len, int *consumedBytes);
 
     // 兼容旧调用方：若不关心消费字节，可使用该重载。
@@ -56,6 +61,7 @@ class HttpContext {
 
     bool isComplete() const { return state_ == State::kComplete; }
     bool isInvalid() const { return state_ == State::kInvalid; }
+    bool payloadTooLarge() const { return payloadTooLarge_; }
 
     // 取出已解析的请求对象（isComplete() 为 true 后才有意义）
     const HttpRequest &request() const { return request_; }
@@ -75,6 +81,10 @@ class HttpContext {
     // 性能优化：在 headers 结束时一次性读取 Content-Length 并缓存，
     // 避免 kBody 状态每次重入时都做 unordered_map 查找（对大文件分段上传效果明显）
     int bodyLen_{0};
+    int requestLineBytes_{0};
+    int headerBytes_{0};
+    Limits limits_{};
+    bool payloadTooLarge_{false};
 
     void saveToken(const std::string &tok); // 根据当前状态提交 token
 };

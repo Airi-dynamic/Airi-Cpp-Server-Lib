@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(day28 LANGUAGES CXX)
+project(day29 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -62,6 +62,9 @@ target_link_libraries(EpollPolicyTest pthread)
 add_executable(HttpContextTest test/HttpContextTest.cpp ${COMMON_SRC})
 target_link_libraries(HttpContextTest pthread)
 
+add_executable(HttpRequestLimitsTest test/HttpRequestLimitsTest.cpp ${COMMON_SRC})
+target_link_libraries(HttpRequestLimitsTest pthread)
+
 add_executable(SocketPolicyTest test/SocketPolicyTest.cpp ${COMMON_SRC})
 target_link_libraries(SocketPolicyTest pthread)
 
@@ -88,15 +91,15 @@ add_executable(StressTest
 add_executable(BenchmarkTest test/BenchmarkTest.cpp)
 target_link_libraries(BenchmarkTest pthread)
 
-# ── CTest 注册（Day 28 引入）──
-# 这些测试用例采用最小化的 stdlib 断言：失败 std::exit(1)，成功 return 0。
-# 把它们注册到 CTest 后，CI 工作流即可通过 `ctest --output-on-failure` 自动跑全集。
-# 与网络相关的 StressTest / BenchmarkTest 不进 CTest，避免 CI 端口冲突或网络抖动。
+# ─────────────────────────────────────────────────────────────────────────
+# Day 28 引入的 CTest 注册（day29 起继承并补充 HttpRequestLimitsTest）
+# ─────────────────────────────────────────────────────────────────────────
 enable_testing()
 add_test(NAME BackpressureDecisionTest COMMAND BackpressureDecisionTest)
 add_test(NAME TcpServerPolicyTest      COMMAND TcpServerPolicyTest)
 add_test(NAME SocketPolicyTest         COMMAND SocketPolicyTest)
 add_test(NAME HttpContextTest          COMMAND HttpContextTest)
+add_test(NAME HttpRequestLimitsTest    COMMAND HttpRequestLimitsTest)
 add_test(NAME EpollPolicyTest          COMMAND EpollPolicyTest)
 add_test(NAME LogTest                  COMMAND LogTest)
 add_test(NAME TimerTest                COMMAND TimerTest)
