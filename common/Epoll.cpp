@@ -22,10 +22,23 @@ Epoll::~Epoll() {
 
 void Epoll::updateChannel(Channel *channel) {
   int fd = channel->getFd();
-  struct kevent change;
-  EV_SET(&change, fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, (void *)channel);
-  errif(kevent(epfd, &change, 1, nullptr, 0, nullptr) == -1,
-        "kqueue update error");
+  struct kevent changes[2];
+  int nchanges = 0;
+
+  uint32_t ev = channel->getEvents();
+
+  if (ev & POLLER_READ) {
+    EV_SET(&changes[nchanges++], fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, (void *)channel);
+  }
+  if (ev & POLLER_WRITE) {
+    EV_SET(&changes[nchanges++], fd, EVFILT_WRITE, EV_ADD | EV_CLEAR, 0, 0, (void *)channel);
+  } else {
+    EV_SET(&changes[nchanges++], fd, EVFILT_WRITE, EV_DELETE, 0, 0, nullptr);
+  }
+
+  for (int i = 0; i < nchanges; ++i) {
+    kevent(epfd, &changes[i], 1, nullptr, 0, nullptr);
+  }
   channel->setInEpoll();
 }
 
@@ -43,8 +56,13 @@ std::vector<Channel *> Epoll::poll(int timeout) {
   std::vector<Channel *> activeChannels;
   for (int i = 0; i < nfds; ++i) {
     Channel *ch = (Channel *)events[i].udata;
-    ch->setRevents(POLLER_READ);
-    activeChannels.push_back(ch);
+    uint32_t revt = 0;
+    if (events[i].filter == EVFILT_READ)  revt |= POLLER_READ;
+    if (events[i].filter == EVFILT_WRITE) revt |= POLLER_WRITE;
+    ch->setRevents(ch->getRevents() | revt);
+    bool found = false;
+    for (auto *c : activeChannels) { if (c == ch) { found = true; break; } }
+    if (!found) activeChannels.push_back(ch);
   }
   return activeChannels;
 }

@@ -36,6 +36,8 @@ void Server::newConnection(Socket *client_sock, InetAddress *client_addr) {
     conn->setDeleteConnectionCallback(cb);
 
     connection[client_sock->getFd()] = conn;
+
+    delete client_addr;
 }
 
 void Server::deleteConnection(Socket *sock) {

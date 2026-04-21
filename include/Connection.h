@@ -1,15 +1,19 @@
 #pragma once
+#include "Buffer.h"
 #include <functional>
 
 class Eventloop;
 class Socket;
 class Channel;
+class Buffer;
 
 class Connection {
   private:
     Eventloop *loop;
     Socket *sock;
     Channel *channel;
+    Buffer inputBuffer_;
+    Buffer outputBuffer_;
 
     std::function<void(Socket *)> deleteConnectionCallback;
 
@@ -17,7 +21,9 @@ class Connection {
     Connection(Eventloop *_loop, Socket *_sock);
     ~Connection();
 
-    // 原来；业务逻辑没有合适的地方放，现在可以放这了，很显然不同的连接有不同业务逻辑
-    void echoRead();
+    void handleRead();
+    void handleWrite();
+    void send(const std::string &msg);
+
     void setDeleteConnectionCallback(std::function<void(Socket *)> _cb);
 };

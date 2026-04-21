@@ -1,36 +1,38 @@
-# Day 08 — Connection 类
+# Day 09 — Buffer 缓冲区
 
 ## 项目状态
 
-在 Day 07（Acceptor 拆分）基础上，引入 **Connection** 类：
+在 Day 08（Connection 类）基础上，引入 **Buffer** 缓冲区：
 
-- `Connection` 封装客户端 Socket + Channel + echoRead 回调
-- `Server` 用 `map<int, Connection*>` 管理所有连接的生命周期
-- 客户端断开时通过 `deleteConnectionCallback` 回调链自动清理
+- `Buffer` 替代栈上 `char buf[1024]`，支持自动扩容、readv 分散读
+- `Connection` 拆为 handleRead + handleWrite + send，实现非阻塞写
+- `Channel` 新增 enableWriting / disableWriting / isWriting，支持读写事件分发
 
 ## 文件结构
 
 ```
-day08/
+day09/
 ├── CMakeLists.txt
 ├── server.cpp
 ├── client.cpp
 ├── include/
-│   ├── Connection.h    ← 新增
+│   ├── Buffer.h        ← 新增
+│   ├── Connection.h    ← 修改：双 Buffer + handleRead/handleWrite/send
+│   ├── Channel.h       ← 修改：读写双回调 + enableWriting
 │   ├── Acceptor.h
-│   ├── Server.h        ← 新增 map + deleteConnection
+│   ├── Server.h
 │   ├── EventLoop.h
-│   ├── Channel.h
 │   ├── Epoll.h
 │   ├── Socket.h
 │   ├── InetAddress.h
 │   └── util.h
 └── common/
-    ├── Connection.cpp  ← 新增
+    ├── Buffer.cpp      ← 新增
+    ├── Connection.cpp  ← 修改
+    ├── Channel.cpp     ← 修改
     ├── Acceptor.cpp
-    ├── Server.cpp      ← 修改
+    ├── Server.cpp
     ├── Eventloop.cpp
-    ├── Channel.cpp
     ├── Epoll.cpp
     ├── Socket.cpp
     ├── InetAddress.cpp
@@ -49,4 +51,6 @@ cmake --build build
 
 ## 改进
 
-- 解决了 Day 06-07 的客户端 Socket/Channel 内存泄漏问题
+- 应用层缓冲区解决半包/粘包问题
+- 非阻塞写：先尝试直接 write，写不完才缓冲 + 注册 EPOLLOUT
+- readv 分散读：一次系统调用最多读取 Buffer 剩余 + 64KB 栈缓冲

@@ -14,8 +14,11 @@ Acceptor::Acceptor(Eventloop *_loop)
     sock->setnonblocking();
 
     acceptChannel = new Channel(loop, sock->getFd());
+
+    // 只要有新连接请求，Channel 就会调用我们注册的 acceptConnection
     std::function<void()> cb = std::bind(&Acceptor::acceptConnection, this);
-    acceptChannel->setCallback(cb);
+    acceptChannel->setReadCallback(cb);
+    acceptChannel->setWriteCallback(nullptr);
     acceptChannel->enableReading();
 }
 
@@ -39,9 +42,10 @@ void Acceptor::acceptConnection() {
 
     if (newConnectionCallback) {
         newConnectionCallback(client_sock, client_addr);
+    } else {
+        delete client_addr;
+        delete client_sock;
     }
-
-    delete client_addr;
 }
 
 void Acceptor::setNewConnectionCallback(std::function<void(Socket *, InetAddress *)> _cb) {

@@ -9,14 +9,6 @@
 #include <sys/epoll.h>
 #endif
 
-#ifdef __APPLE__
-constexpr uint32_t POLLER_READ = 1;
-constexpr uint32_t POLLER_ET   = 2;
-#else
-constexpr uint32_t POLLER_READ = EPOLLIN;
-constexpr uint32_t POLLER_ET   = EPOLLET;
-#endif
-
 class Epoll {
 private:
   int epfd;
