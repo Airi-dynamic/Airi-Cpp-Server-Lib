@@ -20,6 +20,8 @@
 7. **§8** — 静态文件处理器：写 `StaticFileHandler`，支持 ETag / Range / 304 / Content-Disposition
 8. **§9** — 请求超时保护：在 `Options` 里加 `requestTimeoutSec`，Slowloris 防护，超时返 408
 9. **§10** — TLS 接口预留：用 `#ifdef MCPP_HAS_OPENSSL` 守卫的接口桩，为未来 OpenSSL 集成占位
+10. **§10b** — per-IP 令牌桶限流：写 `RateLimiter`，每 IP 独立桶，超限返回 429 + `Retry-After`
+11. **§10c** — Bearer / API Key 鉴权：写 `AuthMiddleware`，白名单 + 三档查找链，失败返回 403
 
 **说明**：代码块前的「来自 `HISTORY/day29/...`」标注意为「将以下代码写入该文件的对应位置」，跟着每步动手输入即可。
 
@@ -86,6 +88,8 @@
 | `common/Connection.cpp` | **修改** | sendFile 实现（sendfile + 降级）；TLS 桩 |
 | `include/TcpServer.h` | **修改** | `Options::TlsOptions` |
 | `test/HttpRequestLimitsTest.cpp` | **新增** | 4 个限流边界用例 |
+| `include/http/RateLimiter.h` | **新增** | per-IP 令牌桶：`Config`/`Bucket`/`tryConsume`/`extractClientIp`/`toMiddleware` |
+| `include/http/AuthMiddleware.h` | **新增** | Bearer + API Key 双模式鉴权：三档查找链 + 白名单 + `toMiddleware` |
 
 ---
 
@@ -1784,6 +1788,469 @@ ssize_t Connection::readFromTransport(char *buf, size_t len, int *savedErrno) {
 | `readFromTransport()` | 握手完成后的 doRead | SSL_read（或明文 read 路径） |
 | `writeToTransport()` | 握手完成后的 doWrite | SSL_write（或明文 write 路径） |
 | `tlsEnabled()` | 任意外部调用 | 让上层无条件判断"本连接是不是 TLS" |
+
+---
+
+## 10b. 补充：per-IP 令牌桶限流（RateLimiter → 429 自动熔断）
+
+### 10b.1 问题背景
+
+§2 已经解决了**单次请求过大（413）**的防御；§9 解决了**连接超时（408）** 的防御。但有一种攻击模式两者都挡不住：
+
+> 攻击方以每秒 500 次的频率发正常大小的 GET 请求，每个请求都合法、都快速完成，但合计消耗掉 Reactor 线程池和数据库连接池。
+
+HTTP 层必须有一道**频率闸门**：每个 IP 在单位时间内最多被允许 N 次请求，超出后自动返回 429 并告诉客户端等多久。
+
+**为什么用令牌桶而非固定窗口计数？**
+
+| 算法 | 行为 | 典型缺陷 |
+|------|------|---------|
+| 固定窗口（每秒计数归零） | 简单，O(1) | 窗口边界处可两倍突发：窗口末尾消耗 N 次 + 窗口开头再消耗 N 次，实际放行 2N |
+| 令牌桶（本实现） | 持续以 `refillRate` 补充，上限 `capacity` | 允许合理突发（桶满时），同时平滑长期速率；无边界漏洞 |
+
+### 10b.2 打开 RateLimiter.h：Config / Bucket / tryConsume
+
+来自 [`src/include/http/RateLimiter.h`](../src/include/http/RateLimiter.h)（行 1–95）：
+
+```cpp
+struct Config {
+    double capacity   = 100.0;   // 桶容量（最大突发请求数）
+    double refillRate =  50.0;   // 每秒补充令牌数（稳态速率上限）
+};
+
+struct Bucket {
+    double tokens;                                      // 当前可用令牌数
+    std::chrono::steady_clock::time_point lastRefill;   // 上次补充时间点
+};
+```
+
+**tryConsume — 一次 mutex 保护的三步操作**：
+
+```cpp
+bool tryConsume(const std::string &ip) {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto now = std::chrono::steady_clock::now();
+    auto &b = buckets_[ip];             // 引用（首次访问自动默认构造）
+
+    // 步骤 1：首次访问初始化（默认构造后 tokens==0.0, lastRefill==epoch）
+    if (b.tokens == 0.0 &&
+        b.lastRefill == std::chrono::steady_clock::time_point{}) {
+        b.tokens     = config_.capacity;    // 满桶
+        b.lastRefill = now;
+    }
+
+    // 步骤 2：按流逝时间补充令牌，上限 capacity
+    double elapsed = std::chrono::duration<double>(now - b.lastRefill).count();
+    b.tokens = std::min(config_.capacity,
+                        b.tokens + elapsed * config_.refillRate);
+    b.lastRefill = now;
+
+    // 步骤 3：尝试消耗 1 个令牌
+    if (b.tokens >= 1.0) {
+        b.tokens -= 1.0;
+        return true;    // 放行
+    }
+    return false;       // 令牌不足 → 返回上层触发 429
+}
+```
+
+**关键不变式**：
+- `buckets_` 是 `unordered_map<string, Bucket>`，对 map 的增删改需要整体一致性，用**单一 `std::mutex`** 比对每个 Bucket 单独加原子变量更简单且正确。
+- `steady_clock` 单调递增（不受 NTP 调整影响），适合做时间差计算。
+
+### 10b.3 extractClientIp — 优先反代转发头
+
+```cpp
+static std::string extractClientIp(const HttpRequest &req) {
+    // 1. X-Forwarded-For: 1.2.3.4, 10.0.0.1  → 取第一段（最原始的客户端 IP）
+    std::string xff = req.header("X-Forwarded-For");
+    if (!xff.empty()) {
+        size_t comma = xff.find(',');
+        return comma != std::string::npos ? xff.substr(0, comma) : xff;
+    }
+    // 2. X-Real-IP（Nginx 单跳直连模式）
+    std::string xri = req.header("X-Real-IP");
+    if (!xri.empty()) return xri;
+    // 3. 无转发头（直连或代理未配置）→ 所有未识别来源归入同一个"unknown"桶
+    return "unknown";
+}
+```
+
+优先级设计原因：`X-Forwarded-For` 是多跳代理场景下公认的 de-facto 标准，第一段是最原始的客户端 IP；`X-Real-IP` 是 Nginx `proxy_set_header X-Real-IP $remote_addr` 惯例，适合单层代理。两者都没有时，同一局域网内的未识别客户端集中到"unknown"桶共享限流配额。
+
+### 10b.4 toMiddleware() — 429 熔断响应
+
+```cpp
+HttpServer::Middleware toMiddleware() {
+    return [this](const HttpRequest &req, HttpResponse *resp,
+                  const HttpServer::MiddlewareNext &next) {
+        std::string ip = extractClientIp(req);
+        if (!tryConsume(ip)) {
+            // 触发限流：挂钩 Metrics 计数器
+            ServerMetrics::instance().onRateLimited();
+            // 构造 429 响应
+            resp->setStatus(HttpResponse::StatusCode::k429TooManyRequests,
+                            "Too Many Requests");
+            resp->setContentType("application/json");
+            resp->setBody(R"({"error":"rate_limit_exceeded","retry_after_sec":1})");
+            resp->addHeader("Retry-After", "1");
+            resp->setCloseConnection(false);  // keep-alive：客户端等 1s 后可在同连接重试
+            return;  // 不调 next() → 中断链路
+        }
+        next();    // 令牌充足 → 放行
+    };
+}
+```
+
+**为什么 setCloseConnection(false)**：连接关闭意味着客户端要重新建立 TCP 三次握手（~RTT 1–3 ms），在高频场景下累积大量额外延迟。保持 keep-alive，客户端等 1 s 后在同一连接上重试更高效；同时也避免大量 TIME_WAIT 状态。
+
+### 10b.5 验证：追踪 IP 被限速的完整请求路径
+
+#### 业务场景 + 时序总览表
+
+配置：`capacity=100, refillRate=50`，某 IP 在约 1 秒内连续发 101 次请求，第 101 次被限速：
+
+| 步 | 请求序号 | Bucket.tokens（进入 tryConsume 前） | 操作 | 返回值 | HTTP 响应 |
+|----|---------|-----------------------------------|------|--------|----------|
+| 1 | 第 1 次 | 0（首次访问，初始化为 100） | tokens 初始化 100 → 99 | true | 200 |
+| 2 | 第 2 次 | 99（elapsed≈0s，几乎无补充） | 99 → 98 | true | 200 |
+| … | … | 递减 | … | true | 200 |
+| 100 | 第 100 次 | 1 | 1 → 0 | true | 200 |
+| 101 | 第 101 次 | 0（elapsed≈0s，补充 ≈ 0） | tokens < 1 | **false** | **429** |
+
+#### 第 1 步：第 1 次请求
+
+代码：见 §10b.2 tryConsume。
+
+**代入实参**：
+- 首次访问，`b.tokens==0.0, b.lastRefill==epoch` → 满桶初始化 `tokens=100`
+- `elapsed ≈ 0` → 补充 ≈ 0
+- `tokens=100 ≥ 1.0` → `tokens = 99`，返回 `true`
+
+#### 第 2 步：第 100 次请求
+
+**代入实参**：
+- `elapsed ≈ 0`（高频请求，时间差极小）→ 补充 ≈ 0
+- `tokens = 1.0 ≥ 1.0` → `tokens = 0`，返回 `true`
+
+#### 第 3 步：第 101 次请求（触发限流）
+
+**代入实参**：
+- `elapsed ≈ 0` → 补充 0
+- `tokens = 0 < 1.0` → **返回 `false`**
+- `toMiddleware` lambda：`tryConsume` 返回 false → 进入 429 分支 → **不调 `next()`** → 链路中断
+
+**副作用快照**（触发后）：
+
+```
+resp.statusCode               = 429
+resp.body                     = {"error":"rate_limit_exceeded","retry_after_sec":1}
+resp.headers["Retry-After"]   = "1"
+ServerMetrics.rateLimitedCount += 1
+runChain                      = 不再推进（后续中间件和 dispatch 跳过）
+```
+
+#### 第 4 步：状态机视图（令牌桶 + 洋葱中间件联动）
+
+```
+              HTTP 请求（IP=1.2.3.4，第 101 次）
+                         │
+                         ▼
+              ┌────────────────────────┐
+              │  RateLimiter MW (in)   │
+              │  tryConsume("1.2.3.4") │
+              │  → tokens=0 → false    │
+              │  setStatus(429)        │
+              │  **不调 next()**        │
+              └────────────┬───────────┘
+                           ✗
+              ┄┄┄┄┄（以下跳过）┄┄┄┄┄┄
+              ┌────────────────────────┐
+              │  AuthMiddleware MW     │
+              └────────────────────────┘
+              ┌────────────────────────┐
+              │  dispatch → handler    │
+              └────────────────────────┘
+```
+
+#### 第 5 步：函数职责一句话表
+
+| 函数 / 字段 | 调用时机 | 职责 |
+|------------|---------|------|
+| `tryConsume(ip)` | toMiddleware lambda 入口 | mutex 保护下补充 + 消耗令牌，返回是否放行 |
+| `extractClientIp(req)` | tryConsume 调用前 | 按优先级从转发头提取真实客户端 IP |
+| `Config::capacity` | 初始化 | 令牌桶上限，决定允许的最大突发请求数 |
+| `Config::refillRate` | tryConsume 步骤 2 | 每秒补充量，决定长期稳态 RPS |
+| `Retry-After: 1` | 429 响应头 | 告知客户端最少等待 1 秒，避免立即重试导致雪崩 |
+| `ServerMetrics::onRateLimited()` | 限流触发时 | 统计计数器，供 `/metrics` 端点查询 |
+
+### 10b.6 使用示例
+
+```cpp
+#include "http/RateLimiter.h"
+// ...
+
+HttpServer srv(loop, listenAddr);
+
+// 每 IP 容量 200 个令牌，每秒补充 100 个（稳态 100 RPS / IP）
+RateLimiter rl({.capacity = 200.0, .refillRate = 100.0});
+
+srv.use(rl.toMiddleware());      // 最外层：任何请求先被计量
+srv.use(cors.toMiddleware());
+srv.use(auth.toMiddleware());
+srv.addRoute(GET, "/api/data", handleData);
+```
+
+---
+
+## 10c. 补充：Bearer Token / API Key 双模式鉴权（AuthMiddleware → 403）
+
+### 10c.1 问题背景
+
+§4.1 使用 `authMiddleware` 作为中间件链示例，但当时只是占位伪代码。生产场景需要同时服务两类客户端：
+
+| 客户端类型 | 鉴权方式 | 典型场景 |
+|-----------|---------|---------|
+| 浏览器 SPA / 移动端 | `Authorization: Bearer <JWT>` | 用户登录后前端拿到 token |
+| 后端服务 / CLI 工具 | `X-API-Key: <key>` 或 `?api_key=<key>` | 机器间通信，长期轮换 |
+
+Bearer 和 API Key 两套鉴权**共存但不冲突**：任一档命中即视为鉴权通过，互不干扰。
+
+**为什么返回 403 而非 401？**
+
+> RFC 7235 规定 401 Unauthorized **必须**包含 `WWW-Authenticate` 响应头，声明挑战机制（Basic / Digest），浏览器收到后会弹出原生登录框。API 场景不需要这套交互——客户端已"知道"怎么认证，认证失败直接 **403 Forbidden** 更语义准确，且不触发浏览器弹窗。
+
+### 10c.2 公开接口与白名单配置
+
+来自 [`src/include/http/AuthMiddleware.h`](../src/include/http/AuthMiddleware.h)（行 1–50）：
+
+```cpp
+class AuthMiddleware {
+  public:
+    // 注册合法的 Bearer token（可多个，支持轮换）
+    void addBearerToken(const std::string &token) { bearerTokens_.insert(token); }
+    // 注册合法的 API Key
+    void addApiKey(const std::string &key) { apiKeys_.insert(key); }
+    // 白名单：精确匹配 URL（如 "/health", "/metrics"）
+    void addPublicPath(const std::string &path) { publicPaths_.insert(path); }
+    // 白名单：前缀匹配（如 "/static/" 覆盖整个子目录）
+    void addPublicPrefix(const std::string &prefix) { publicPrefixes_.push_back(prefix); }
+
+  private:
+    std::unordered_set<std::string> bearerTokens_;
+    std::unordered_set<std::string> apiKeys_;
+    std::unordered_set<std::string> publicPaths_;
+    std::vector<std::string>        publicPrefixes_;  // 有序，按注册先后前缀匹配
+};
+```
+
+**数据结构选型**：
+- `unordered_set` 查找 O(1)，Token 数量少但每次请求都要查。
+- `vector<string>` 前缀列表：前缀匹配不能直接哈希，顺序遍历且通常只有几项，vector 足够。
+
+### 10c.3 isPublic() — 两段白名单检查
+
+```cpp
+bool isPublic(const std::string &url) const {
+    // 精确路径（如 "/health", "/metrics", "/favicon.ico"）
+    if (publicPaths_.count(url)) return true;
+    // 前缀路径（如 "/static/" 匹配 "/static/logo.png"）
+    for (const auto &prefix : publicPrefixes_) {
+        if (url.compare(0, prefix.size(), prefix) == 0) return true;
+    }
+    return false;
+}
+```
+
+### 10c.4 authenticate() — 三档查找链
+
+```cpp
+bool authenticate(const HttpRequest &req) const {
+    // 档 1：Authorization: Bearer <token>
+    //   格式：首部值前 7 字节必须是 "Bearer "
+    std::string auth = req.header("Authorization");
+    if (auth.size() > 7 && auth.compare(0, 7, "Bearer ") == 0) {
+        std::string token = auth.substr(7);      // 截取 token 部分
+        if (bearerTokens_.count(token)) return true;
+    }
+
+    // 档 2：X-API-Key 请求头（机器间调用惯例）
+    std::string apiKey = req.header("X-API-Key");
+    if (!apiKey.empty() && apiKeys_.count(apiKey)) return true;
+
+    // 档 3：?api_key= 查询参数（兼容旧客户端 / 链接直分享）
+    std::string queryKey = req.queryParam("api_key");
+    if (!queryKey.empty() && apiKeys_.count(queryKey)) return true;
+
+    return false;   // 三档均未命中
+}
+```
+
+**查找顺序设计理由**：
+1. Bearer Token 优先：JWT 场景下 Bearer 是标准用法，安全性最高（仅在 Header 传输，不会出现在服务器日志的 URL 记录里）。
+2. `X-API-Key` 次之：Header 传输，不暴露在日志 URL 中，机器间通信推荐。
+3. `?api_key=` 最低优先级：URL 参数会被服务器日志记录，有泄露风险，仅作兼容保留。
+
+### 10c.5 toMiddleware() — 三段防卫
+
+```cpp
+HttpServer::Middleware toMiddleware() {
+    return [this](const HttpRequest &req, HttpResponse *resp,
+                  const HttpServer::MiddlewareNext &next) {
+        // 防卫 1：白名单路径直通，不做任何鉴权
+        if (isPublic(req.url())) {
+            next();
+            return;
+        }
+        // 防卫 2：未配置任何 token/key → 鉴权模块禁用（开发模式直通）
+        if (bearerTokens_.empty() && apiKeys_.empty()) {
+            next();
+            return;
+        }
+        // 防卫 3：真正鉴权
+        if (authenticate(req)) {
+            next();
+            return;
+        }
+        // 鉴权失败 → 403
+        ServerMetrics::instance().onAuthRejected();
+        resp->setStatus(HttpResponse::StatusCode::k403Forbidden, "Forbidden");
+        resp->setContentType("application/json");
+        resp->setBody(R"({"error":"unauthorized","message":"valid token or API key required"})");
+        // 不调 next() → 链路中断
+    };
+}
+```
+
+### 10c.6 验证：追踪一次鉴权失败的完整路径
+
+#### 业务场景 + 时序总览表
+
+配置：`auth.addBearerToken("secret-token")`，`auth.addPublicPath("/health")`。
+请求：`GET /api/data`，`Authorization: Bearer wrong-token`
+
+| 步 | 进入函数 | 操作 | 结果 |
+|----|---------|------|------|
+| 1 | `toMiddleware` lambda | `isPublic("/api/data")` | false（不在白名单） |
+| 2 | `toMiddleware` lambda | `bearerTokens_.empty()` = false | 继续鉴权 |
+| 3 | `authenticate(req)` | `auth="Bearer wrong-token"` → `token="wrong-token"` | `bearerTokens_.count("wrong-token") = 0` |
+| 4 | `authenticate(req)` | `X-API-Key` 头为空 | 跳过档 2 |
+| 5 | `authenticate(req)` | `?api_key=` 参数为空 | 跳过档 3 |
+| 6 | `authenticate(req)` | 返回 false | 鉴权失败 |
+| 7 | `toMiddleware` lambda | `onAuthRejected()`，setStatus(403)，**不调 next()** | 链路中断 |
+
+对比：`GET /health`（同样没有有效 token）：
+
+| 步 | 进入函数 | 操作 | 结果 |
+|----|---------|------|------|
+| 1 | `toMiddleware` lambda | `isPublic("/health")` | true → `next()`，**直通** |
+
+#### 第 1 步：白名单精确匹配
+
+代码：见 §10c.3 isPublic()。
+
+**代入实参（鉴权失败路径）**：
+- `url = "/api/data"`
+- `publicPaths_ = {"/health"}`
+- `publicPaths_.count("/api/data") = 0`
+- `publicPrefixes_` 为空
+- 返回 false → 继续执行鉴权逻辑
+
+#### 第 2 步：authenticate() 档 1（Bearer）
+
+```cpp
+std::string auth = req.header("Authorization");
+// auth = "Bearer wrong-token"
+// auth.size() = 18 > 7 ✓
+// auth.compare(0, 7, "Bearer ") == 0 ✓
+std::string token = auth.substr(7);
+// token = "wrong-token"
+bearerTokens_.count("wrong-token")   // = 0 → 不命中
+```
+
+档 2（`X-API-Key` 头为空）、档 3（无 `?api_key=` 参数）同样不命中，`authenticate()` 返回 false。
+
+#### 第 3 步：403 响应与链路中断
+
+```
+resp.statusCode    = 403
+resp.body          = {"error":"unauthorized","message":"valid token or API key required"}
+ServerMetrics.authRejectedCount += 1
+runChain           = 不再推进（后续中间件和 dispatch 跳过）
+```
+
+#### 第 4 步：状态机视图（auth + ratelimiter 推荐组合顺序）
+
+```
+              HTTP 请求 → 中间件链
+              ┌────────────────────────┐
+              │  RateLimiter MW        │  先限频次（粗过滤，早截断）
+              │  tryConsume(ip)=true   │
+              │  调用 next()           │
+              └────────────┬───────────┘
+                           ▼
+              ┌────────────────────────┐
+              │  AuthMiddleware MW     │  再验身份（精校验）
+              │  isPublic? No          │
+              │  authenticate? fail    │
+              │  setStatus(403)        │
+              │  **不调 next()**        │
+              └────────────┬───────────┘
+                           ✗
+              ┄┄┄┄┄（以下跳过）┄┄┄┄┄┄
+              ┌────────────────────────┐
+              │  CorsMiddleware        │
+              └────────────────────────┘
+              ┌────────────────────────┐
+              │  dispatch → handler    │
+              └────────────────────────┘
+```
+
+**注册顺序解释**：RateLimiter 在 AuthMiddleware 之前。原因：先限流可以在密码爆破攻击早期截断请求，避免每次都走 token 查找；逻辑语义也更清晰——"先限频次，再验身份"。
+
+#### 第 5 步：函数职责一句话表
+
+| 函数 / 字段 | 调用时机 | 职责 |
+|------------|---------|------|
+| `addBearerToken / addApiKey` | 启动前配置 | 向有效凭据集合注册 token/key |
+| `addPublicPath / addPublicPrefix` | 启动前配置 | 配置白名单，跳过鉴权的精确/前缀路径 |
+| `isPublic(url)` | toMiddleware lambda 第一步 | 两段白名单短路，避免对公开路径做不必要鉴权 |
+| `authenticate(req)` | toMiddleware lambda 第三步 | 三档查找：Bearer → X-API-Key → ?api_key= |
+| `onAuthRejected()` | 鉴权失败时 | Metrics 计数，供 `/metrics` 端点查询 |
+
+### 10c.7 与 RateLimiter 协同的完整注册模板
+
+```cpp
+#include "http/RateLimiter.h"
+#include "http/AuthMiddleware.h"
+#include "http/CorsMiddleware.h"
+
+HttpServer srv(loop, listenAddr);
+
+// 1. 限流（最外层：任何请求都先被计量）
+RateLimiter rl({.capacity = 200.0, .refillRate = 100.0});
+srv.use(rl.toMiddleware());
+
+// 2. 鉴权（次层：限流通过的请求验身份）
+AuthMiddleware auth;
+auth.addBearerToken("Bearer demo-token-2024");
+auth.addApiKey("sk-xxx");
+auth.addPublicPath("/health");
+auth.addPublicPath("/metrics");
+auth.addPublicPrefix("/static/");
+srv.use(auth.toMiddleware());
+
+// 3. CORS（在业务前注入响应头）
+CorsMiddleware cors;
+cors.allowOrigin("https://myapp.com")
+    .allowMethods({"GET", "POST", "OPTIONS"})
+    .allowHeaders({"Content-Type", "Authorization"});
+srv.use(cors.toMiddleware());
+
+// 4. 业务路由
+srv.addRoute(HttpRequest::Method::kGet,  "/api/data",   handleData);
+srv.addRoute(HttpRequest::Method::kPost, "/api/upload", handleUpload);
+```
 
 ---
 
