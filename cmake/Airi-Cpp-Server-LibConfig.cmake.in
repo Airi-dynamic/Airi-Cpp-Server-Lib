@@ -1,0 +1,11 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+if("@MYCPPSERVERLIB_WITH_OPENSSL@" STREQUAL "ON")
+	find_dependency(OpenSSL REQUIRED)
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/Airi-Cpp-Server-LibTargets.cmake")
+
+check_required_components("Airi-Cpp-Server-Lib")

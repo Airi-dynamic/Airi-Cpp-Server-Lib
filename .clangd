@@ -1,0 +1,92 @@
+---
+# 全局编译配置：告诉 clangd 使用 build/ 目录中的 compile_commands.json，
+# 并对未在编译数据库中的文件（如未启用 MCPP_ENABLE_COROUTINES 时的 async/*.h、
+# 未启用 MCPP_ENABLE_IO_URING 时的 io_uring 文件等）提供合理的回退编译参数。
+CompileFlags:
+  CompilationDatabase: build
+  Add:
+    - -std=c++20
+    - -Wno-unknown-warning-option
+Index:
+  Background: Build
+Diagnostics:
+  UnusedIncludes: Strict
+  MissingIncludes: None
+---
+# HISTORY/ 是历史快照，不属于当前项目构建，屏蔽全部诊断
+If:
+  PathExclude: HISTORY/.*
+Diagnostics:
+  Suppress: '*'
+---
+# examples/ 与 demo/ 有独立的 CMake 入口或编译规则，不在主 compile_commands.json 中
+If:
+  PathMatch:
+    - examples/.*
+    - demo/.*
+Diagnostics:
+  Suppress: '*'
+---
+# kqueue 文件仅 macOS 编译；epoll/io_uring 仅 Linux 编译。
+# 针对当前未参与构建的平台目录，统一屏蔽诊断。
+If:
+  PathMatch:
+    - .*/kqueue/.*\.cpp
+    - .*/KqueuePoller\.h
+    - .*/epoll/.*\.cpp
+    - .*/EpollPoller\.h
+    - .*/io_uring/.*\.cpp
+    - .*/IoUringPoller\.h
+Diagnostics:
+  Suppress: ['*']
+---
+# Airi-Cpp-Server-Lib.h 是伞形头文件，unused include 警告无意义
+If:
+  PathMatch: .*/Airi-Cpp-Server-Lib\.h
+Diagnostics:
+  UnusedIncludes: None
+---
+# 协程/异步/内存池等 day32+ 新增模块，编译数据库依赖 MCPP_ENABLE_COROUTINES，
+# 当未开启该选项时强制回退到 C++20 模式并补全平台特性宏
+If:
+  PathMatch:
+    - .*/src/include/async/.*\.h
+    - .*/src/include/memory/.*\.h
+    - .*/src/common/async/.*\.cpp
+    - .*/src/test/CoroutineTest\.cpp
+    - .*/src/test/LockFreeQueueTest\.cpp
+    - .*/src/test/MemoryPoolTest\.cpp
+CompileFlags:
+  Add:
+    - -std=c++20
+    - -DMCPP_HAS_COROUTINES=1
+---
+CompileFlags:
+  CompilationDatabase: build
+---
+# HISTORY/ 是历史快照，不属于当前项目构建，屏蔽全部诊断
+If:
+  PathExclude: HISTORY/.*
+Diagnostics:
+  Suppress: '*'
+---
+# examples/ 有独立的 CMakeLists.txt，不在主 compile_commands.json 中，屏蔽诊断
+If:
+  PathExclude: examples/.*
+Diagnostics:
+  Suppress: '*'
+---
+# kqueue 文件仅用于 macOS，在 Linux 上无法编译，屏蔽一切诊断
+# PathMatch 是正则表达式列表，同时覆盖 .cpp 和 .h
+If:
+  PathMatch:
+    - .*/kqueue/.*\.cpp
+    - .*/KqueuePoller\.h
+Diagnostics:
+  Suppress: ['*']
+---
+# Airi-Cpp-Server-Lib.h 是伞形头文件，unused include 警告无意义
+If:
+  PathMatch: .*/Airi-Cpp-Server-Lib\.h
+Diagnostics:
+  UnusedIncludes: None

@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>Airi-Cpp-Server-Lib Demo</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+        .card {
+            background: white;
+            border-radius: 16px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.2);
+            padding: 40px 48px;
+            max-width: 760px;
+            width: 100%;
+        }
+        h1 { font-size: 1.9rem; color: #1a202c; margin-bottom: 6px; }
+        .sub { color: #718096; font-size: 0.95rem; margin-bottom: 12px; }
+        .badge {
+            display: inline-block;
+            background: #ebf8ff;
+            color: #2b6cb0;
+            padding: 3px 10px;
+            border-radius: 12px;
+            font-size: 0.78rem;
+            margin: 2px 4px 2px 0;
+        }
+        h2 { font-size: 1.05rem; color: #2d3748; margin: 24px 0 10px; }
+        ul { list-style: none; }
+        li { padding: 7px 0; border-bottom: 1px dashed #edf2f7; font-size: 0.92rem; }
+        li:last-child { border: none; }
+        .method {
+            display: inline-block;
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            background: #38a169;
+            color: white;
+            padding: 1px 7px;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            margin-right: 8px;
+            min-width: 56px;
+            text-align: center;
+        }
+        .method.opt { background: #ed8936; }
+        a { color: #2b6cb0; text-decoration: none; font-family: ui-monospace, monospace; }
+        a:hover { text-decoration: underline; }
+        .desc { color: #718096; font-size: 0.82rem; margin-left: 8px; }
+        code {
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            background: #f7fafc;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 0.85rem;
+            color: #d53f8c;
+        }
+        .footer { margin-top: 28px; color: #a0aec0; font-size: 0.78rem; text-align: center; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>Airi-Cpp-Server-Lib</h1>
+        <p class="sub">高性能 C++ Reactor HTTP 服务器 · day30 生产就绪演示</p>
+        <p>
+            <span class="badge">epoll/kqueue</span>
+            <span class="badge">multi-reactor</span>
+            <span class="badge">middleware</span>
+            <span class="badge">rate-limit</span>
+            <span class="badge">auth</span>
+            <span class="badge">CORS</span>
+            <span class="badge">gzip</span>
+            <span class="badge">sendfile</span>
+            <span class="badge">prometheus</span>
+        </p>
+
+        <h2>开放端点（无需鉴权）</h2>
+        <ul>
+            <li><span class="method">GET</span> <a href="/health">/health</a><span class="desc">健康检查（K8s liveness/readiness）</span></li>
+            <li><span class="method">GET</span> <a href="/metrics">/metrics</a><span class="desc">Prometheus 文本格式指标</span></li>
+            <li><span class="method">GET</span> <a href="/static/index.html">/static/*</a><span class="desc">静态资源（ETag / 304 / Range）</span></li>
+            <li><span class="method">GET</span> <a href="/files/readme.txt">/files/*</a><span class="desc">用户文件（sendfile 零拷贝）</span></li>
+        </ul>
+
+        <h2>受保护端点（需 Bearer 或 API Key）</h2>
+        <ul>
+            <li><span class="method">GET</span> <a href="/api/users">/api/users</a><span class="desc">JSON 用户列表（直接点击会 403）</span></li>
+            <li><span class="method opt">OPTIONS</span> /api/users<span class="desc">CORS 预检 → 204</span></li>
+        </ul>
+
+        <h2>调用示例</h2>
+        <ul>
+            <li><code>curl -H "Authorization: Bearer demo-token-2024" http://localhost:8888/api/users</code></li>
+            <li><code>curl -H "X-API-Key: api-key-001" http://localhost:8888/api/users</code></li>
+            <li><code>for i in $(seq 1 300); do curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8888/; done | sort | uniq -c</code></li>
+        </ul>
+
+        <p class="footer">完整面试演示流程见仓库根目录 <code>INTERVIEW_GUIDE.md</code></p>
+    </div>
+</body>
+</html>
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>Airi-Cpp-Server-Lib Demo</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            background: #f0f4f8;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+        }
+        .card {
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+            padding: 40px;
+            max-width: 500px;
+            width: 90%;
+            text-align: center;
+        }
+        h1 { font-size: 1.8rem; color: #1a202c; margin-bottom: 8px; }
+        .subtitle { color: #718096; font-size: 0.95rem; margin-bottom: 32px; }
+        .badge {
+            display: inline-block;
+            background: #ebf8ff;
+            color: #2b6cb0;
+            border: 1px solid #bee3f8;
+            border-radius: 20px;
+            padding: 4px 12px;
+            font-size: 0.8rem;
+            margin: 0 4px 8px;
+        }
+        .nav { margin-top: 32px; display: flex; flex-direction: column; gap: 12px; }
+        .btn {
+            display: block;
+            padding: 12px 24px;
+            border-radius: 8px;
+            text-decoration: none;
+            font-weight: 600;
+            font-size: 1rem;
+            transition: opacity 0.15s;
+        }
+        .btn:hover { opacity: 0.85; }
+        .btn-primary { background: #4299e1; color: white; }
+        .btn-secondary { background: #48bb78; color: white; }
+        .btn-outline { background: white; color: #4a5568; border: 2px solid #e2e8f0; }
+        .features {
+            margin-top: 28px;
+            text-align: left;
+            background: #f7fafc;
+            border-radius: 8px;
+            padding: 16px 20px;
+        }
+        .features h3 { color: #4a5568; font-size: 0.85rem; text-transform: uppercase;
+                        letter-spacing: 0.05em; margin-bottom: 8px; }
+        .features li { color: #718096; font-size: 0.9rem; padding: 3px 0; list-style: none; }
+        .features li::before { content: "✓  "; color: #48bb78; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>Airi-Cpp-Server-Lib</h1>
+        <p class="subtitle">基于自研 C++ 多 Reactor 网络库的 HTTP Demo</p>
+
+        <div>
+            <span class="badge">Reactor 模式</span>
+            <span class="badge">kqueue / epoll</span>
+            <span class="badge">异步日志</span>
+            <span class="badge">定时器</span>
+        </div>
+
+        <nav class="nav">
+            <a href="/fileserver" class="btn btn-primary">📁 文件管理服务器</a>
+            <a href="/login.html" class="btn btn-secondary">🔐 登录演示</a>
+            <a href="/echo" class="btn btn-outline">↩ Echo 测试（POST）</a>
+        </nav>
+
+        <div class="features">
+            <h3>已实现功能</h3>
+            <ul>
+                <li>静态文件服务（HTML / 图片）</li>
+                <li>文件列表、下载、删除</li>
+                <li>文件上传（multipart/form-data）</li>
+                <li>POST 登录表单验证</li>
+                <li>302 重定向</li>
+            </ul>
+        </div>
+    </div>
+</body>
+</html>
