@@ -1,0 +1,41 @@
+{
+  // ── clangd（主 LSP）──────────────────────────────────────────────────────
+  // 关闭 cpptools IntelliSense 引擎，避免与 clangd 产生双重提示/诊断冲突。
+  // cpptools 保留调试（launch.json）和 Makefile Task 等非 IntelliSense 功能。
+  "C_Cpp.intelliSenseEngine": "disabled",
+  // clangd 本体参数
+  "clangd.arguments": [
+    "--background-index",         // 后台全量索引，Go-to-Def 不需要先打开文件
+    "--clang-tidy",               // 随编辑实时运行 clang-tidy（规则来自 .clang-tidy）
+    "--completion-style=detailed",// 补全项显示参数类型
+    "--header-insertion=never",   // 不自动插入 #include（C++ 项目中通常更安全）
+    "--inlay-hints=true",         // 参数名 / 返回类型 inlay hints
+    "--log=error"                 // 减少 clangd 自身的噪音日志
+  ],
+  // ── cmake-tools ──────────────────────────────────────────────────────────
+  "cmake.buildDirectory": "${workspaceFolder}/build",
+  "cmake.buildType": "Release",
+  // 与 tasks.json 保持一致：不自动弹窗要求 Configure
+  "cmake.configureOnOpen": false,
+  // 构建完成后不自动把 cmake-tools 状态栏切到 Debug
+  "cmake.statusBarVisibility": "compact",
+  // ── 文件关联 ─────────────────────────────────────────────────────────────
+  // 无扩展名头文件（如 <string>）和 .h 均作为 C++ 处理
+  "files.associations": {
+    "*.h": "cpp",
+    "*.tpp": "cpp",
+    "*.ipp": "cpp"
+  },
+  // ── 编辑器体验 ───────────────────────────────────────────────────────────
+  "editor.formatOnSave": false,       // 由开发者手动 Format（Shift+Alt+F），不强制
+  "editor.semanticHighlighting.enabled": true, // clangd 提供语义着色
+  // ── 排除不需要 IntelliSense 的大目录，加速索引 ──────────────────────────
+  "files.watcherExclude": {
+    "**/HISTORY/**": true,
+    "**/build/**": true
+  },
+  "search.exclude": {
+    "**/HISTORY": true,
+    "**/build": true
+  }
+}

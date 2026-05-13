@@ -166,7 +166,11 @@ void Eventloop::loop() {
 void Eventloop::queueInLoop(std::function<void()> func) {
     {
         std::unique_lock<std::mutex> lock(mutex_);
-        pendingFunctors_.emplace_back(func);
+        // 必须 std::move：若按 const ref 形式 emplace_back(func)，会与形参 func
+        // 共享 std::function 的内部小对象/引用计数，调用方析构形参时会触发对
+        // vector 元素的并发释放，进而把所捕获对象（如 shared_ptr<Connection>）
+        // 的归零落到错误线程。
+        pendingFunctors_.emplace_back(std::move(func));
     }
     wakeup();
 }

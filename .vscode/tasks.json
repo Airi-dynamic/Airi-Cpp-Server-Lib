@@ -1,0 +1,117 @@
+{
+  // VS Code 任务：构建 / 运行 / 压测一站式入口。
+  // 任务依赖图：
+  //   cmake:configure
+  //     ├─ build:lib          (libAiri-Cpp-Server-Lib.a)
+  //     ├─ build:example      (examples/http_server) ─ 含库链接
+  //     └─ build:bench        (tools/conn_scale_test)
+  //   run:server              ← build:example
+  //   bench:wrk+rss           ← build:example, build:bench
+  "version": "2.0.0",
+  "options": {
+    "cwd": "${workspaceFolder}",
+    "env": {
+      "MYCPPSERVER_BIND_IP": "127.0.0.1",
+      "MYCPPSERVER_BIND_PORT": "18888"
+    }
+  },
+  "tasks": [
+    {
+      "label": "cmake:configure",
+      "type": "shell",
+      "command": "cmake",
+      "args": ["-S", ".", "-B", "build", "-DCMAKE_BUILD_TYPE=Release"],
+      "problemMatcher": [],
+      "presentation": { "reveal": "silent", "panel": "shared", "clear": false },
+      "detail": "生成 build/ 目录与 compile_commands.json"
+    },
+    {
+      "label": "build:lib",
+      "type": "shell",
+      "command": "cmake",
+      "args": ["--build", "build", "--target", "NetLib", "-j"],
+      "dependsOn": ["cmake:configure"],
+      "group": "build",
+      "problemMatcher": ["$gcc"],
+      "presentation": { "reveal": "always", "panel": "shared", "clear": true },
+      "detail": "只编译网络库本体（输出 build/libAiri-Cpp-Server-Lib.a）"
+    },
+    {
+      "label": "build:example",
+      "type": "shell",
+      "command": "cmake",
+      "args": ["--build", "build", "--target", "http_server", "-j"],
+      "dependsOn": ["cmake:configure"],
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": ["$gcc"],
+      "presentation": { "reveal": "always", "panel": "shared", "clear": true },
+      "detail": "编译 examples/ 目录的示例服务器（隐式触发 NetLib）"
+    },
+    {
+      "label": "build:bench",
+      "type": "shell",
+      "command": "cmake",
+      "args": ["--build", "build", "--target", "conn_scale_test", "-j"],
+      "dependsOn": ["cmake:configure"],
+      "group": "build",
+      "problemMatcher": ["$gcc"],
+      "presentation": { "reveal": "always", "panel": "shared", "clear": true },
+      "detail": "编译 RSS / 长连接规模压测工具（输出 build/tools/conn_scale_test）"
+    },
+    {
+      "label": "build:all",
+      "dependsOn": ["build:lib", "build:example", "build:bench"],
+      "dependsOrder": "parallel",
+      "problemMatcher": [],
+      "detail": "并行构建库 + 示例 + 压测工具"
+    },
+    {
+      "label": "run:server",
+      "type": "shell",
+      "command": "./build/examples/http_server",
+      "dependsOn": ["build:example"],
+      "isBackground": false,
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+      "detail": "前台运行示例服务器（监听 ${env:MYCPPSERVER_BIND_PORT}），Ctrl+C 退出"
+    },
+    {
+      "label": "clean:incremental",
+      "type": "shell",
+      "command": "cmake",
+      "args": ["--build", "build", "--target", "clean"],
+      "problemMatcher": [],
+      "presentation": { "reveal": "silent", "panel": "shared", "clear": false },
+      "detail": "删除编译产物，保留 CMakeCache / Makefile（无需重新 configure）"
+    },
+    {
+      "label": "clean:full",
+      "type": "shell",
+      "command": "rm",
+      "args": ["-rf", "build"],
+      "problemMatcher": [],
+      "presentation": { "reveal": "silent", "panel": "shared", "clear": false },
+      "detail": "彻底删除 build/ 目录（下次构建前需重新 configure）"
+    },
+    {
+      "label": "clean:reconfigure",
+      "type": "shell",
+      "command": "bash",
+      "args": ["-c", "rm -rf build && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release"],
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "shared", "clear": true },
+      "detail": "完整清理并重新 configure（一键恢复干净状态）"
+    },
+    {
+      "label": "bench:wrk+rss",
+      "type": "shell",
+      "command": "bash",
+      "args": ["${workspaceFolder}/scripts/bench.sh"],
+      "dependsOn": ["build:example", "build:bench"],
+      "dependsOrder": "parallel",
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+      "detail": "后台拉起示例服务器 → wrk 30s 压测 → RSS 长连接测试 → 自动停服"
+    }
+  ]
+}

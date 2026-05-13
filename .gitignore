@@ -131,7 +131,6 @@ REFERENCE/
 EXAMPLE/
 CHAT/
 TMP/
-/.vscode
 .DS_Store
 debug/build*/
 

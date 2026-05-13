@@ -175,6 +175,10 @@ add_executable(LogTest EXCLUDE_FROM_ALL src/test/LogTest.cpp)
 target_link_libraries(LogTest NetLib pthread)
 set_target_properties(LogTest PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${MCPP_TOOL_DIR})
 
+# 海量长连接 / RSS 增长测试（独立可执行，不依赖 NetLib，纯 socket 客户端）
+add_executable(conn_scale_test EXCLUDE_FROM_ALL benchmark/conn_scale_test.cpp)
+set_target_properties(conn_scale_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${MCPP_TOOL_DIR})
+
 # 性能基准统一交给业界标准 wrk + Docker，见 benchmark/muduo_compare/
 
 # Phase 4 早期演示服务器（仅作历史参考，默认不构建）

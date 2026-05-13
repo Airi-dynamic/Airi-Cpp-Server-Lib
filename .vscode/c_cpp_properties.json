@@ -1,0 +1,28 @@
+{
+  // c_cpp_properties.json：供 cpptools 调试器 / Browse 索引使用。
+  // IntelliSense 已由 clangd 接管（settings.json: "C_Cpp.intelliSenseEngine": "disabled"）。
+  // 此处配置仅影响 cpptools 的 Browse Database 和 Launch.json 调试器。
+  "configurations": [
+    {
+      "name": "macOS (AppleClang / arm64)",
+      // 指向 cmake configure 后生成的完整编译数据库
+      "compileCommands": "${workspaceFolder}/build/compile_commands.json",
+      "intelliSenseMode": "macos-clang-arm64",
+      "cStandard": "c17",
+      "cppStandard": "c++17",
+      // 备用 include 路径：仅在 compile_commands.json 不存在（尚未 cmake configure）时生效
+      "includePath": [
+        "${workspaceFolder}/src/include",
+        "${workspaceFolder}/src/include/net",
+        "${workspaceFolder}/src/include/net/Poller",
+        "${workspaceFolder}/src/include/timer",
+        "${workspaceFolder}/src/include/log",
+        "${workspaceFolder}/src/include/http",
+        "${workspaceFolder}/src/include/async",
+        "${workspaceFolder}/src/include/memory"
+      ],
+      "defines": []
+    }
+  ],
+  "version": 4
+}
