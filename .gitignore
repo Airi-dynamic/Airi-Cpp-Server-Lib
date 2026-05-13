@@ -139,3 +139,10 @@ examples/external/
 
 # day36 docker benchmark 输出（每次运行都会重新生成）
 benchmark/muduo_compare/results/
+
+# benchmark 运行时产物（trace / 火焰图采样）─ 仅保留目录与 .gitkeep
+benchmark/instruments/*
+!benchmark/instruments/.gitkeep
+benchmark/flamegraph/*
+!benchmark/flamegraph/.gitkeep
+!benchmark/flamegraph/sample_wrk30s.txt

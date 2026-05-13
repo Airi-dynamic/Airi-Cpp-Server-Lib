@@ -10,7 +10,7 @@ PORT="${MYCPPSERVER_BIND_PORT:-18888}"
 
 # ── 1. 启动服务器（后台）────────────────────────────────────────────────────
 echo "── starting server on 127.0.0.1:${PORT} ──"
-"${ROOT_DIR}/build/examples/http_server" > /tmp/airi_server.log 2>&1 &
+MYCPPSERVER_BIND_PORT="${PORT}" "${ROOT_DIR}/build/examples/http_server" > /tmp/airi_server.log 2>&1 &
 SERVER_PID=$!
 
 cleanup() {

@@ -112,6 +112,26 @@
       "problemMatcher": [],
       "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
       "detail": "后台拉起示例服务器 → wrk 30s 压测 → RSS 长连接测试 → 自动停服"
+    },
+    {
+      "label": "bench:flamegraph",
+      "type": "shell",
+      "command": "bash",
+      "args": ["${workspaceFolder}/scripts/flamegraph.sh"],
+      "dependsOn": ["build:example"],
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+      "detail": "wrk 加压 + sample/perf 采样 10s，输出火焰图原始栈到 benchmark/flamegraph/"
+    },
+    {
+      "label": "bench:instruments",
+      "type": "shell",
+      "command": "bash",
+      "args": ["${workspaceFolder}/scripts/instruments_profile.sh"],
+      "dependsOn": ["build:example"],
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+      "detail": "macOS xctrace 录制 30s wrk 压测下 CPU 采样，产物为 .trace（双击用 Instruments 打开）。需 sudo。"
     }
   ]
 }

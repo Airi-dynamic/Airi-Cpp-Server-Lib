@@ -13,10 +13,6 @@ option(MCPP_ENABLE_TSAN    "Enable ThreadSanitizer"   OFF)
 option(MCPP_ENABLE_UBSAN   "Enable UndefinedBehaviorSanitizer" OFF)
 option(MCPP_ENABLE_COVERAGE "Enable code coverage (gcov / llvm-cov)" OFF)
 
-# day31-36 的加分实验（WebSocket / 协程 / io_uring / 无锁队列 / 内存池）仅作为实验分支保留在
-# HISTORY/day31…day36/ 中供参考，未合入本主代码树。请勿重新启用下面这些开关：
-#   MCPP_ENABLE_COROUTINES、MCPP_ENABLE_IO_URING
-
 # C++ 标准
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -178,13 +174,6 @@ set_target_properties(LogTest PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${MCPP_TOOL_DI
 # 海量长连接 / RSS 增长测试（独立可执行，不依赖 NetLib，纯 socket 客户端）
 add_executable(conn_scale_test EXCLUDE_FROM_ALL benchmark/conn_scale_test.cpp)
 set_target_properties(conn_scale_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${MCPP_TOOL_DIR})
-
-# 性能基准统一交给业界标准 wrk + Docker，见 benchmark/muduo_compare/
-
-# Phase 4 早期演示服务器（仅作历史参考，默认不构建）
-add_executable(demo_server EXCLUDE_FROM_ALL demo/demo_server.cpp)
-target_link_libraries(demo_server NetLib pthread)
-set_target_properties(demo_server PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${MCPP_EXAMPLE_DIR})
 
 # ── 主演示服务器（中间件链 / 限流 / 鉴权 / CORS / gzip / 静态文件）────
 add_executable(http_server examples/src/http_server.cpp)

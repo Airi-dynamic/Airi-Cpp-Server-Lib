@@ -210,6 +210,32 @@ Sanitizer 与覆盖率请直接看 [`.github/workflows/ci.yml`](.github/workflow
 
 ---
 
+## 性能评估
+
+保留三个必要的评估手段，覆盖从"应用层吏吞"到"内核采样热点"三个视角：
+
+| 维度 | 工具 | 入口 | 一句话回答 |
+| --- | --- | --- | --- |
+| 应用吏吞 + 资源 | wrk + `conn_scale_test` | `bench:wrk+rss` task / `scripts/bench.sh` | 吏吞 + RSS 同场别量 |
+| CPU 热点 (跨平台) | macOS `sample` / Linux `perf` + FlameGraph | `bench:flamegraph` task / `scripts/flamegraph.sh` | 产出原始堆栈 + 可选 SVG 火焰图 |
+| CPU 热点 (macOS 深度) | Apple `xctrace` | `bench:instruments` task / `scripts/instruments_profile.sh` | 产出 `.trace`，双击用 Instruments 打开看函数级 CPU 占比 |
+
+历史实测报告与分析参见 [`benchmark/benchmark_report.md`](benchmark/benchmark_report.md) 和 [`benchmark/HOTSPOT_ANALYSIS.md`](benchmark/HOTSPOT_ANALYSIS.md)。
+
+```bash
+# wrk 30s + RSS 长连接测试
+./scripts/bench.sh
+
+# macOS sample / Linux perf 采样火焰图
+./scripts/flamegraph.sh
+# 设置 FLAMEGRAPH_DIR=~/FlameGraph 可自动渲染 SVG
+
+# macOS 深度采样（需 sudo）
+./scripts/instruments_profile.sh
+```
+
+---
+
 ## 30 天开发日志
 
 [`dev-log/`](dev-log/) 收录了 day01 → day36 全部 36 篇日志，每篇 1~2 万字，覆盖：
