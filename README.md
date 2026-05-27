@@ -247,3 +247,138 @@ Sanitizer 与覆盖率请直接看 [`.github/workflows/ci.yml`](.github/workflow
 - **day31–day36**（实验分支）：WebSocket、C++20 协程、io_uring、无锁队列、内存池、与 muduo 横向基准。
 
 > day31–day36 的代码不在主分支，但日志保留并在顶部加了实验分支说明。
+
+---
+
+## 可视化监控（Prometheus + Grafana）
+
+`monitoring/` 目录提供一套开箱即用的可观测性栈：Prometheus 定期抓取服务器 `/metrics` 端点，Grafana 自动加载预置仪表盘，无需任何手动配置。
+
+### 监控栈组成
+
+| 组件 | 部署方式 | 地址 | 作用 |
+| --- | --- | --- | --- |
+| **Prometheus** | Docker（`monitoring/docker-compose.yml`） | `http://localhost:9090` | 采集并存储指标（5s 间隔） |
+| **Grafana** | Docker（`monitoring/docker-compose.yml`） | `http://localhost:3000` | 可视化仪表盘，自动匿名 Admin 登录 |
+| **node_exporter** | macOS Homebrew 宿主机服务 | `http://localhost:9100` | 系统级 CPU / 内存 / 网卡指标 |
+| **服务器 /metrics** | 随示例服务器启动 | `http://localhost:18888/metrics` | 应用级 QPS / 延迟 / 连接数等 |
+
+Grafana 仪表盘共 9 个面板：
+
+| 面板 | 指标 |
+| --- | --- |
+| QPS | `rate(mcpp_requests_total[30s])` |
+| 延迟（Avg / P50 / P99） | `histogram_quantile` over `mcpp_request_duration_us_bucket` |
+| 响应状态码分布 | `rate(mcpp_requests_total{status=...}[30s])` |
+| 网络吞吐（读/写 B/s） | `rate(mcpp_bytes_read/written_total[30s])` |
+| 活跃连接数 | `mcpp_connections_active` |
+| 限流拒绝率 | `rate(mcpp_rate_limited_total[30s])` |
+| CPU 利用率（各核） | `1 - rate(node_cpu_seconds_total{mode="idle"}[30s])` |
+| 内存占用 | `node_memory_active_bytes`（macOS） |
+| 网卡流量 | `rate(node_network_receive/transmit_bytes_total[30s])` |
+
+---
+
+### 启动步骤
+
+**前置依赖**
+
+```bash
+# macOS：安装 Docker Desktop（须已启动）
+# macOS：安装 node_exporter
+brew install node_exporter
+```
+
+**第一步：启动 node_exporter（宿主机系统指标）**
+
+```bash
+brew services start node_exporter
+# 验证：curl -s http://localhost:9100/metrics | head -5
+```
+
+**第二步：编译并启动示例服务器**
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target http_server -j
+
+MYCPPSERVER_BIND_PORT=18888 ./build/examples/http_server
+# 验证：curl http://localhost:18888/metrics
+```
+
+**第三步：启动 Prometheus + Grafana**
+
+```bash
+cd monitoring
+docker compose up -d
+```
+
+等待约 5 秒让 Grafana 完成初始化，然后打开 <http://localhost:3000>。  
+仪表盘已自动加载，无需登录，直接选择 **"Airi Cpp Server"** 即可查看实时数据。
+
+**第四步（可选）：运行压测以产生真实流量**
+
+```bash
+# 需先安装 wrk：brew install wrk
+wrk -t4 -c100 -d60s http://127.0.0.1:18888/
+```
+
+在压测过程中观察 Grafana 面板中的 QPS / 延迟 / 网络吞吐变化。
+
+---
+
+### 关闭步骤
+
+```bash
+# 停止 Prometheus + Grafana（保留数据卷）
+cd monitoring && docker compose stop
+
+# 完全清除容器和数据卷
+cd monitoring && docker compose down -v
+
+# 停止 node_exporter
+brew services stop node_exporter
+
+# 停止示例服务器
+# 在运行 http_server 的终端按 Ctrl+C
+```
+
+---
+
+### 验证采集状态
+
+```bash
+# Prometheus 抓取目标是否全部 UP
+curl -s 'http://localhost:9090/api/v1/targets' \
+  | python3 -c 'import sys,json; [print(t["labels"]["job"], t["health"]) for t in json.load(sys.stdin)["data"]["activeTargets"]]'
+# 期望输出：
+# airi-cpp-server up
+# node-exporter   up
+
+# Grafana 已加载的仪表盘
+curl -s 'http://localhost:3000/api/search?type=dash-db' \
+  | python3 -c 'import sys,json; [print(d["title"]) for d in json.load(sys.stdin)]'
+# 期望输出：
+# Airi Cpp Server
+```
+
+---
+
+### 目录结构
+
+```
+monitoring/
+├── docker-compose.yml          # Prometheus + Grafana 容器定义
+├── prometheus.yml              # 抓取配置（服务器 18888 + node_exporter 9100）
+├── grafana-dashboard.json      # 仪表盘源文件（可导入 Grafana 手动使用）
+└── grafana/
+    ├── provisioning/
+    │   ├── datasources/
+    │   │   └── prometheus.yml  # 自动注册 Prometheus 数据源（uid: prometheus）
+    │   └── dashboards/
+    │       └── airi.yml        # 自动加载 dashboards/ 目录下所有 JSON
+    └── dashboards/
+        └── airi.json           # 运行时仪表盘（datasource uid 已硬编码为 prometheus）
+```
+
+> **注意**：`grafana/dashboards/airi.json` 中数据源 uid 硬编码为 `"prometheus"`，与 provisioning 自动注册的 datasource uid 一致。若手动导入 `grafana-dashboard.json` 到其他 Grafana 实例，请确保该实例的 Prometheus 数据源 uid 也为 `prometheus`，否则面板会显示 "No data"。

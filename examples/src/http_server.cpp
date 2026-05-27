@@ -309,7 +309,7 @@ static HttpServer::Middleware makeAccessLogMiddleware() {
 
 // ── 主程序 ────────────────────────────────────────────────────────────────────
 int main(int argc, char *argv[]) {
-    Logger::setLogLevel(Logger::INFO);
+    Logger::setLogLevel(Logger::WARN);  // 性能测试：关闭 INFO 热路径日志
 
     // 异步日志：将所有 LOG_* 输出重定向到文件（双缓冲，不阻塞业务线程）。
     // 必须在 chdir 之前创建，以便日志文件落在二进制所在目录（build/examples/）。
@@ -340,7 +340,7 @@ int main(int argc, char *argv[]) {
     if (const char *envPort = std::getenv("MYCPPSERVER_BIND_PORT")) {
         options.tcp.listenPort = static_cast<uint16_t>(std::atoi(envPort));
     }
-    options.tcp.ioThreads = 0; // 自动按硬件线程数
+    options.tcp.ioThreads = 0; // 固定 2 IO 线程（对齐 benchmark_report.md）
     options.tcp.maxConnections = 10000;
     options.requestTimeoutSec = 15.0; // Slowloris 防护
     options.idleTimeoutSec = 60.0;
@@ -363,7 +363,9 @@ int main(int argc, char *argv[]) {
     srv.use(makeAccessLogMiddleware());
 
     // 限流：每 IP 最多 200 个突发请求，稳态 100 RPS
-    RateLimiter rateLimiter({/*capacity=*/200.0, /*refillRate=*/100.0});
+    //   ⚠️ 压测模式已放宽至 1M RPS（与 ioThreads=2 / Logger::WARN 同属 benchmark 配置）；
+    //      生产展示请改回 capacity=200, refillRate=100
+    RateLimiter rateLimiter({/*capacity=*/2000000.0, /*refillRate=*/1000000.0});
     srv.use(rateLimiter.toMiddleware());
 
     // CORS：必须排在 Auth 之前，使 OPTIONS 预检请求能直接 204 返回

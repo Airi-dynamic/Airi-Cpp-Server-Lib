@@ -75,7 +75,8 @@ void HttpServer::addPrefixRoute(HttpRequest::Method method, const std::string &p
 // ── 新连接建立：为每条连接创建独立的 HttpContext ─────────────────────────────
 void HttpServer::onNewConnection(Connection *conn) {
     conn->setContext(HttpConnectionContext{limits_});
-    conn->touchLastActive(); // 记录连接建立时间作为初始活跃时间
+    // 说明：Connection 构造时已初始化 lastActive_（同为 main-reactor 线程上下文），
+    // 此处不再跨线程写该字段，避免与 sub-reactor 上的定时器读取产生数据竞争。
 
     ServerMetrics::instance().onConnectionAccepted();
 
@@ -128,9 +129,9 @@ void HttpServer::onMessage(Connection *conn) {
         }
     }
 
-    // 每次收到数据即更新活跃时间（供空闲超时计时器参考）
-    if (autoClose_)
-        conn->touchLastActive();
+    // 说明：活跃时间戳由 Connection::doRead/doWrite 字节级维护，读写任一方向有
+    // 进展都会起新空闲窗口。HTTP 层不再重复 touchLastActive（避免与 doRead
+    // 重复赋值；也保证“长写无入”场景不会被误杀）。
 
     Buffer *buf = conn->getInputBuffer();
     // 关键修复：同一个 TCP 包中可能包含多个 HTTP 请求（pipeline / 粘包）。
@@ -167,6 +168,7 @@ void HttpServer::onMessage(Connection *conn) {
 
         if (consumed > 0) {
             buf->retrieve(static_cast<size_t>(consumed));
+            ServerMetrics::instance().addBytesRead(consumed);
         } else {
             // 理论上 len>0 时应至少消费 1 字节。该保护用于规避异常输入导致的死循环。
             LOG_WARN << "[HttpServer] 解析未前进，等待更多数据，fd=" << conn->getSocket()->getFd();
@@ -235,10 +237,15 @@ bool HttpServer::onRequest(Connection *conn, const HttpRequest &req) {
     LOG_INFO << "[HttpServer] " << req.methodString() << " " << req.url() << " -> "
              << static_cast<int>(resp.statusCode());
 
-    conn->send(resp.serialize());
+    std::string serialized = resp.serialize();
+    const auto serializedSize = serialized.size();
+    ServerMetrics::instance().addBytesWritten(static_cast<int64_t>(serializedSize));
+    // 使用 move 重载：临时序列化串直接移交给 send，避免一次 std::string 拷贝。
+    conn->send(std::move(serialized));
 
     if (resp.hasSendFile()) {
         conn->sendFile(resp.sendFilePath(), resp.sendFileOffset(), resp.sendFileCount());
+        ServerMetrics::instance().addBytesWritten(static_cast<int64_t>(resp.sendFileCount()));
     }
 
     if (resp.closeConnection()) {

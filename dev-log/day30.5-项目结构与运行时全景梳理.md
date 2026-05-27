@@ -157,32 +157,163 @@ TcpServer::~TcpServer() {
 
 ## 3. 启动顺序：从 `main()` 到 `mainReactor_->loop()` 的每一步
 
-### 3.1 时序总览
+### 3.1 调用链总览（树形 + 关键代码）
 
-下面是 `examples/src/http_server.cpp` 调用 `srv.start()` 之前 + `start()` 内部，按时间从上到下发生的所有事件。"线程"列表示这一步运行在哪个线程。
+> 设业务侧配置 `setThreadNums(4)`，即 1 个 main-reactor + 4 个 sub-reactor + 1 个异步日志后端，共 6 个线程。本节展示 `main()` 第一行 → 全部线程都阻塞在 `kevent()` 等待事件这一段的完整调用树。
 
-| 时刻 | 线程 | 动作 | 关键状态 / 副作用 |
-|---|---|---|---|
-| T0.0 | T0 | `AsyncLogging asyncLog("airi_server")` 构造 | 仅设置成员，未启线程 |
-| T0.1 | T0 | `asyncLog.start()` | 启动后端线程 [T_log]，等 latch 后端就绪后返回 |
-| T0.2 | T0 | `Logger::setOutput([&]{ asyncLog.append(...) })` | 全局回调指针指向 asyncLog |
-| T0.3 | T0 | `HttpServer srv(options)` 构造 | 内部 → `TcpServer` 构造 |
-| T0.4 | T0 | ↳ `mainReactor_ = make_unique<Eventloop>()` | 构造主 EventLoop（poller、wakeupFd、timerQueue） |
-| T0.5 | T0 | ↳ `acceptor_ = make_unique<Acceptor>(mainReactor_, "0.0.0.0", 18888)` | `socket()` + `bind()` + `listen()` + 加入 mainReactor 的 poller |
-| T0.6 | T0 | ↳ `acceptor_->setNewConnectionCallback(&TcpServer::newConnection)` | 注册"新连接到达"回调 |
-| T0.7 | T0 | ↳ `threadPool_ = make_unique<EventLoopThreadPool>(mainReactor_)`，`setThreadNums(N)` | 仅设置数字，未启线程 |
-| T0.8 | T0 | `srv.use(...)` × 5 | middlewares_ vector push_back 5 个 std::function |
-| T0.9 | T0 | `srv.addRoute(...)`、`addPrefixRoute(...)` | routes_ map / prefixRoutes_ vector 填充 |
-| T0.10 | T0 | `Signal::signal(SIGINT, [&]{ srv.stop(); })` | 全局信号表注册 |
-| T0.11 | T0 | `srv.start()` → `server_->Start()` | ↓ 进入下面 11 步 |
-| T1.0 | T0 | ↳ `threadPool_->start()` | for i = 0..N-1： |
-| T1.1 | T0 | ↳↳ `EventLoopThread t; t.startLoop()` | 启动线程 Ti，**同步等待** Ti 内 EventLoop 就绪 |
-| T1.2 | Ti | ↳↳↳ Ti 进入 `threadFunc()`：`loop_ = make_unique<Eventloop>()` | sub-reactor 在 Ti 线程内构造 → tid_=Ti |
-| T1.3 | Ti | ↳↳↳ `cv_.notify_one()` 通知 T0 | T0 的 startLoop() 返回 loop_.get() |
-| T1.4 | Ti | ↳↳↳ `loop_->loop()` 进入 sub-reactor 主循环 | 阻塞在 `kevent()` |
-| T1.5 | T0 | 回到 T0：`loops_.push_back(loop)` | T0 持有 N 个 sub-reactor 的裸指针 |
-| T2.0 | T0 | ↳ `mainReactor_->loop()` | 主线程进入 main-reactor 主循环 |
-| T2.1 | T0 | ↳↳ 阻塞在 `kevent()` 等待新连接 | listen fd 在 poller 中 |
+#### 整体调用树
+
+主线程 T0 启动两类后台线程：异步日志后端 T_log、N 个 sub-reactor 工作线程 T1..TN。每一次跨线程同步都用 `═══════ sync ═══════►` 标出（latch 或 condition_variable）。
+
+```
+┌───────────────────────────── T0 (main thread) ─────────────────────────────┐
+│                                                                            │
+│  main()                                                                    │
+│    ├─ AsyncLogging asyncLog("airi_server")                                 │
+│    │     └─ 仅初始化成员，未启线程                                         │
+│    │                                                                       │
+│    ├─ asyncLog.start()                                                     │
+│    │     ├─ thread_ = std::thread(&AsyncLogging::threadFunc, this) ═══════ spawn T_log ═══┐
+│    │     └─ latch_.wait()              // 阻塞，等 T_log 端 countDown                       │
+│    │                                                                                      │
+│    ├─ Logger::setOutput([&]{ asyncLog.append(...); })                                     │
+│    │     └─ 全局函数指针指向 asyncLog 写后端                                                  │
+│    │                                                                                      │
+│    ├─ HttpServer srv(options)                                                             │
+│    │     └─ TcpServer(options)                                                            │
+│    │          ├─ mainReactor_ = make_unique<Eventloop>()                                  │
+│    │          │     ├─ poller_ = newDefaultPoller(this)   // kqueue() / epoll_create1()   │
+│    │          │     ├─ timerQueue_ = make_unique<TimerQueue>(this)                        │
+│    │          │     ├─ pipe(pipeFds) → wakeupRead/WriteFd_                                │
+│    │          │     └─ evtChannel_->enableReading()                                       │
+│    │          │          └─ kevent(EV_ADD|EVFILT_READ, wakeupReadFd_)                     │
+│    │          ├─ acceptor_ = make_unique<Acceptor>(mainReactor_, "0.0.0.0", 18888)        │
+│    │          │     ├─ socket() → bind() → listen() → fcntl(O_NONBLOCK)                   │
+│    │          │     └─ acceptChannel_->enableReading()                                    │
+│    │          │          └─ kevent(EV_ADD|EVFILT_READ, listen_fd)                         │
+│    │          ├─ acceptor_->setNewConnectionCallback(&TcpServer::newConnection)           │
+│    │          └─ threadPool_ = make_unique<EventLoopThreadPool>(mainReactor_)             │
+│    │                └─ setThreadNums(4)    // 仅记数字，未启线程                             │
+│    │                                                                                      │
+│    ├─ srv.use(...) × 5                  // middlewares_ vector += 5                       │
+│    ├─ srv.addRoute(...) / addPrefixRoute(...)                                             │
+│    ├─ Signal::signal(SIGINT, [&]{ srv.stop(); })                                          │
+│    │                                                                                      │
+│    └─ srv.start() → server_->Start()                                                      │
+│         ├─ threadPool_->start()                                                           │
+│         │     └─ for i = 1..4：                                                           │
+│         │          ├─ t = make_unique<EventLoopThread>()                                  │
+│         │          ├─ loop = t->startLoop()                                               │
+│         │          │     ├─ thread_ = std::thread(&threadFunc, this) ═════ spawn Ti ═════┐│
+│         │          │     └─ cv_.wait(lock, [&]{ return loopReady_; })  // 阻塞等 Ti     ││
+│         │          │                            ◄═════════════════════════ notify ══════╝│
+│         │          ├─ loops_.push_back(loop)                                              │
+│         │          └─ threads_.push_back(std::move(t))                                    │
+│         └─ mainReactor_->loop()                                                           │
+│              └─ while(!quit_) { poll() ... }   // ★ 阻塞在 kevent，待客状态              │
+└────────────────────────────────────────────────────────────────────────────────────────────┘
+                                                                                            
+┌───────────────────────────── T_log (logging backend) ─────────────────────────────────────┐
+│                                                                                           │
+│  AsyncLogging::threadFunc()                                                               │
+│    ├─ output_ = make_unique<LogFile>(basename_)   // open() 日志文件                      │
+│    ├─ latch_.countDown()    ════════════════════════ release T0's latch_.wait() ═════════►│
+│    └─ while(running_) {                                                                   │
+│           cv_.wait_for(lock, 3s, [&]{ return !currentBuffers_.empty(); })                 │
+│           swap(currentBuffers_, buffersToWrite_)                                          │
+│           output_->append(...)   // 批量写盘                                              │
+│         }                                                                                 │
+└───────────────────────────────────────────────────────────────────────────────────────────┘
+
+┌───────────────────────────── Ti (i = 1..4, sub-reactor) ──────────────────────────────────┐
+│                                                                                           │
+│  EventLoopThread::threadFunc()                                                            │
+│    ├─ loop_ = make_unique<Eventloop>()        // ★ 必须在 Ti 内构造，tid_ = Ti            │
+│    │     └─ kqueue() / pipe() / evtChannel_ enableReading                                 │
+│    ├─ {                                                                                   │
+│    │     unique_lock lock(mutex_);                                                        │
+│    │     loopReady_ = true;                                                               │
+│    │     cv_.notify_one();   ════════════════════════════ wake T0's startLoop() ═════════►│
+│    │  }                                                                                   │
+│    └─ loop_->loop()                                                                       │
+│         └─ while(!quit_) { poll() ... }       // 阻塞在 kevent，关注 wakeupReadFd_       │
+└───────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 关键代码块
+
+**① 启动后等就绪 —— `AsyncLogging::start` 用 latch 拒绝"日志先到、文件未开"**
+
+```cpp
+void AsyncLogging::start() {
+    running_.store(true, std::memory_order_release);
+    thread_ = std::thread(&AsyncLogging::threadFunc, this);
+    latch_.wait();  // 等 threadFunc 内 latch_.countDown() 之后才返回
+}
+
+void AsyncLogging::threadFunc() {
+    output_ = std::make_unique<LogFile>(basename_);
+    latch_.countDown();          // ★ 文件已就绪，放 T0 走
+    while (running_.load(std::memory_order_acquire)) { ... }
+}
+```
+
+**② 子线程内构造 EventLoop —— `EventLoopThread::threadFunc` 保证 `tid_` 正确**
+
+```cpp
+Eventloop *EventLoopThread::startLoop() {
+    thread_ = std::thread(&EventLoopThread::threadFunc, this);
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [this] { return loopReady_; });
+    }
+    return loop_.get();
+}
+
+void EventLoopThread::threadFunc() {
+    loop_ = std::make_unique<Eventloop>();   // ★ 构造发生在 Ti，tid_ 捕获 Ti
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+        loopReady_ = true;
+        cv_.notify_one();
+    }
+    loop_->loop();
+}
+```
+
+> 这一步的语义陷阱：若改成 T0 构造完 `Eventloop` 再交给 Ti 跑 loop，则 `Eventloop::tid_` 保存的会是 T0；之后 sub-reactor 自己跑 `runInLoop` 时 `isInLoopThread()` 永远返回 false → 全部退化为 `queueInLoop`，性能崩塌且语义错乱。
+
+**③ Reactor 主循环 —— `Eventloop::loop` 是所有 6 个线程进入"待客"的归宿**
+
+```cpp
+void Eventloop::loop() {
+    while (!quit_) {
+        int timeout = timerQueue_->nextTimeoutMs();
+        std::vector<Channel *> channels = poller_->poll(timeout);
+        for (auto *ch : channels)
+            ch->handleEvent();
+        timerQueue_->processExpiredTimers();
+        doPendingFunctors();
+    }
+}
+```
+
+**④ 启动完成后的全局快照（N=4）**
+
+```text
+活跃线程：T0(main), T1, T2, T3, T4, T_log
+mainReactor (在 T0):
+   poller_.kqueueFd_  = 7
+   wakeupReadFd_/WriteFd_ = 5/6
+   kqueue 关注 = { wakeupReadFd_, listen_fd=8 }
+sub-reactor T_i (i=1..4):
+   poller_.kqueueFd_  = 各自 1 个
+   wakeupReadFd_/WriteFd_ = 各自 1 对 pipe
+   kqueue 关注 = { wakeupReadFd_ }   // 暂无 client
+T_log: 阻塞在 cv_.wait_for(3s)
+```
+
+`Start()` 此后不再返回，直到 `SIGINT` → `srv.stop()` → `mainReactor_->setQuit() + wakeup()` → `loop()` 退出。
 
 ### 3.2 逐函数代码追踪
 

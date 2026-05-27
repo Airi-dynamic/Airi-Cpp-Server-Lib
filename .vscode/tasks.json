@@ -76,6 +76,42 @@
       "detail": "前台运行示例服务器（监听 ${env:MYCPPSERVER_BIND_PORT}），Ctrl+C 退出"
     },
     {
+      "label": "bench:wrk",
+      "type": "shell",
+      "command": "bash",
+      "args": [
+        "-c",
+        "wrk -t4 -c100 -d60s --latency http://127.0.0.1:${MYCPPSERVER_BIND_PORT}/"
+      ],
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+      "detail": "对已运行的服务器执行 60s wrk 压测（4 线程 / 100 并发），需服务器已启动"
+    },
+    {
+      "label": "bench:wrk-ramp",
+      "type": "shell",
+      "command": "bash",
+      "args": [
+        "-c",
+        "URL=http://127.0.0.1:${MYCPPSERVER_BIND_PORT}/; for C in 10 50 200 500 1000 2000; do echo \"=== connections=$C ===\"; wrk -t4 -c$C -d20s --latency $URL; sleep 5; done"
+      ],
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+      "detail": "阶梯加压：10→50→200→500→1000→2000 并发，每档 20s，观察吞吐拐点与延迟膝点"
+    },
+    {
+      "label": "bench:wrk-mixed",
+      "type": "shell",
+      "command": "bash",
+      "args": [
+        "-c",
+        "PORT=${MYCPPSERVER_BIND_PORT}; ( wrk -t2 -c50 -d60s http://127.0.0.1:$PORT/ & wrk -t2 -c50 -d60s http://127.0.0.1:$PORT/files/readme.txt & wrk -t2 -c50 -d60s -H 'Authorization: Bearer secret-token-123' http://127.0.0.1:$PORT/api/users & wait )"
+      ],
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+      "detail": "混合负载：同时压 / + /files/readme.txt + /api/users（带 Auth），观察 dashboard 区分不同路径的影响"
+    },
+    {
       "label": "clean:incremental",
       "type": "shell",
       "command": "cmake",
