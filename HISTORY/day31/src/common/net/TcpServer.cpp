@@ -129,7 +129,7 @@ bool TcpServer::shouldRejectNewConnection(size_t currentCount, size_t maxConnect
     return currentCount >= maxConnections;
 }
 
-void TcpServer::Start() {
+void TcpServer::start() {
     // 1. 启动所有 IO 线程：每个线程在内部构造 EventLoop 并进入 loop()
     //    start() 内部同步等待每个 EventLoop 就绪后才返回，
     //    此后 nextLoop() 可安全使用
@@ -199,12 +199,14 @@ void TcpServer::deleteConnection(int fd) {
             // 保证 Connection::~Connection()（调用 loop_->deleteChannel）
             // 发生在该 sub-reactor 本次 poll() 结束、events_ 遍历完毕之后，
             // 消除 Channel* 悬空野指针风险。
-            // shared_ptr 包装 unique_ptr：满足 std::function 对可复制性的要求，
-            // 引用计数归零时自动析构 Connection，无需 release()+delete。
-            std::shared_ptr<Connection> guard(std::move(conn));
-            ioLoop->queueInLoop([guard]() {
-                // guard 在此作用域结束时析构，Connection 被安全释放
-            });
+            //
+            // 关键：不能用 shared_ptr 包装 — std::function 拷贝/std::function
+            // 临时副本会导致引用计数最后一次归零落在调用方（main-reactor）线程，
+            // ~Connection 在错误线程触发 KqueuePoller events_ 缓存的 Channel* UAF。
+            // 用 release() 拿到裸指针，lambda 内 delete：所有权唯一落在 lambda
+            // body，无论 std::function 拷贝多少次，析构必发生在 ioLoop 线程。
+            Connection *raw = conn.release();
+            ioLoop->queueInLoop([raw]() { delete raw; });
         }
     });
 }

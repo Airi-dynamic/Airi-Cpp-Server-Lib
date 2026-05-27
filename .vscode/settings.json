@@ -9,8 +9,12 @@
     "--clang-tidy",               // 随编辑实时运行 clang-tidy（规则来自 .clang-tidy）
     "--completion-style=detailed",// 补全项显示参数类型
     "--header-insertion=never",   // 不自动插入 #include（C++ 项目中通常更安全）
-    "--inlay-hints=true",         // 参数名 / 返回类型 inlay hints
-    "--log=error"                 // 减少 clangd 自身的噪音日志
+    // 注：clangd 22 已移除 --inlay-hints 启动开关（默认开启），由
+    // editor.inlayHints.enabled / clangd.inlayHints.* 控制
+    "--log=error",                // 减少 clangd 自身的噪音日志
+    // 让 clangd 向 Apple Clang 查询内建 include 路径，避免 Homebrew LLVM
+    // 资源目录的 string.h / stddef.h 遮蔽 Apple SDK 的 libc++ 包装头文件
+    "--query-driver=/usr/bin/c++,/usr/bin/clang++,/usr/bin/cc,/usr/bin/clang"
   ],
   // ── cmake-tools ──────────────────────────────────────────────────────────
   "cmake.buildDirectory": "${workspaceFolder}/build",

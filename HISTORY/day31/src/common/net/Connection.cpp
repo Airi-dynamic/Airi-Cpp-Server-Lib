@@ -36,6 +36,10 @@ Connection::Connection(int fd, Eventloop *loop)
     // 不在构造函数中 enableReading / enableET，
     // 由 TcpServer::newConnection 设置好所有回调后，通过 enableInLoop() 启用
     state_ = State::kConnected;
+    // 在构造时（main-reactor 线程）初始化活跃时间戳，确保上层无需跨线程触摸。
+    // 该写入与稍后通过 queueInLoop 投递到 sub-reactor 的 enableInLoop 之间，
+    // 依赖 wakeup eventfd 的 release/acquire 语义保证可见性，无竞态。
+    lastActive_ = TimeStamp::now();
 }
 
 #ifdef MCPP_HAS_OPENSSL
@@ -236,7 +240,8 @@ void Connection::doRead() {
 #endif
 
         if (n > 0) {
-            // 本次读到数据，继续循环尝试读取更多（ET 模式可能有大量数据）
+            // 本次读到数据，刷新活跃时间戳并继续循环（ET 模式可能有大量数据）
+            lastActive_ = TimeStamp::now();
             continue;
         } else if (n == 0) {
             state_ = State::kClosed;
@@ -333,6 +338,8 @@ void Connection::doWrite() {
             savedErrno = errno;
 #endif
         if (n > 0) {
+            // 写出字节即视为活跃，避免大响应/慢客户端期间被空闲超时误杀
+            lastActive_ = TimeStamp::now();
             outputBuffer_.retrieve(static_cast<size_t>(n));
             continue;
         }

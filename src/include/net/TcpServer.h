@@ -86,7 +86,7 @@ class TcpServer {
     static bool shouldRejectNewConnection(size_t currentCount, size_t maxConnections);
     static int normalizeIoThreadCount(int configured, unsigned int hardwareCount);
 
-    void Start(); // 启动所有 sub-reactor 线程和 main-reactor 循环
+    void start(); // 启动所有 sub-reactor 线程和 main-reactor 循环
     void stop();  // 令所有 Reactor 退出循环
 
     void newConnection(int fd);

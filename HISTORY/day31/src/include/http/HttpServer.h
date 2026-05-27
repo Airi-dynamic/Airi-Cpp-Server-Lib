@@ -4,7 +4,6 @@
 #include "http/HttpContext.h"
 #include "http/HttpRequest.h"
 #include "http/HttpResponse.h"
-#include "http/WebSocket.h"
 #include <cstddef>
 #include <functional>
 #include <memory>
@@ -62,10 +61,6 @@ class HttpServer {
     // 中间件链：按注册顺序执行，middleware 内部不调用 next() 可中断后续链路。
     void use(Middleware middleware) { middlewares_.emplace_back(std::move(middleware)); }
 
-    // WebSocket 路由：当收到 Upgrade: websocket 请求且 path 匹配时，
-    // 自动完成握手并将连接切换到 WebSocket 模式。
-    void addWebSocketRoute(const std::string &path, WebSocketHandler handler);
-
     // 最大连接数保护（透传到 TcpServer）
     void setMaxConnections(size_t maxConnections) { server_->setMaxConnections(maxConnections); }
 
@@ -95,9 +90,6 @@ class HttpServer {
     // 返回 true 表示连接可继续处理后续请求；false 表示已进入关闭流程。
     bool onRequest(Connection *conn, const HttpRequest &req);
 
-    // 尝试处理 WebSocket 升级请求，返回 true 表示已处理（无论成功与否）
-    bool tryWebSocketUpgrade(Connection *conn, const HttpRequest &req);
-
     // 默认响应：404 Not Found
     void defaultCallback(const HttpRequest &req, HttpResponse *resp);
 
@@ -112,7 +104,6 @@ class HttpServer {
     std::vector<Middleware> middlewares_;
     std::vector<PrefixRoute> prefixRoutes_;
     std::unordered_map<std::string, RouteHandler> routes_;
-    std::unordered_map<std::string, WebSocketHandler> wsRoutes_;
 
     HttpContext::Limits limits_{};
     double requestTimeoutSec_{15.0};

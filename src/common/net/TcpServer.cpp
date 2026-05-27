@@ -129,7 +129,7 @@ bool TcpServer::shouldRejectNewConnection(size_t currentCount, size_t maxConnect
     return currentCount >= maxConnections;
 }
 
-void TcpServer::Start() {
+void TcpServer::start() {
     // 1. 启动所有 IO 线程：每个线程在内部构造 EventLoop 并进入 loop()
     //    start() 内部同步等待每个 EventLoop 就绪后才返回，
     //    此后 nextLoop() 可安全使用

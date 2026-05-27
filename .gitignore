@@ -125,12 +125,6 @@ CTestTestfile.cmake
 lib/
 *.cmake
 
-
-docs/
-REFERENCE/
-EXAMPLE/
-CHAT/
-TMP/
 .DS_Store
 debug/build*/
 

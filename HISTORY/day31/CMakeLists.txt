@@ -8,19 +8,13 @@ project(Airi-Cpp-Server-Lib VERSION 1.0.0 LANGUAGES CXX)
 
 option(MCPP_ENABLE_OPENSSL "Enable TLS support via OpenSSL" ON)
 option(MCPP_ENABLE_TESTING "Build tests (requires GoogleTest via FetchContent)" ON)
-option(MCPP_ENABLE_COROUTINES "Enable C++20 coroutine I/O (requires C++20 compiler)" OFF)
-option(MCPP_ENABLE_IO_URING "Enable io_uring backend (Linux 5.1+, requires liburing)" OFF)
 option(MCPP_ENABLE_ASAN    "Enable AddressSanitizer"  OFF)
 option(MCPP_ENABLE_TSAN    "Enable ThreadSanitizer"   OFF)
 option(MCPP_ENABLE_UBSAN   "Enable UndefinedBehaviorSanitizer" OFF)
 option(MCPP_ENABLE_COVERAGE "Enable code coverage (gcov / llvm-cov)" OFF)
 
-# C++ 标准 (协程需要 C++20)
-if(MCPP_ENABLE_COROUTINES)
-    set(CMAKE_CXX_STANDARD 20)
-else()
-    set(CMAKE_CXX_STANDARD 17)
-endif()
+# C++ 标准
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # ── Sanitizer flags ─────────────────────────────────────────────
@@ -81,6 +75,16 @@ if(MCPP_ENABLE_OPENSSL)
     endif()
 endif()
 
+# zlib 链接与宏（gzip 中间件需要）
+find_package(ZLIB QUIET)
+if(ZLIB_FOUND)
+    target_link_libraries(NetLib PUBLIC ZLIB::ZLIB)
+    target_compile_definitions(NetLib PUBLIC MCPP_HAS_ZLIB=1)
+    message(STATUS "Airi-Cpp-Server-Lib: zlib found, gzip middleware enabled")
+else()
+    message(STATUS "Airi-Cpp-Server-Lib: zlib not found, gzip middleware disabled")
+endif()
+
 # 设置头文件搜索路径：构建时(BUILD_INTERFACE)和安装后(INSTALL_INTERFACE)
 target_include_directories(NetLib 
     PUBLIC 
@@ -90,12 +94,16 @@ target_include_directories(NetLib
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include/timer>
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include/log>
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include/http>
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include/async>
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include/memory>
         $<INSTALL_INTERFACE:include/Airi-Cpp-Server-Lib>
         $<INSTALL_INTERFACE:include/Airi-Cpp-Server-Lib/net>
         $<INSTALL_INTERFACE:include/Airi-Cpp-Server-Lib/net/Poller>
         $<INSTALL_INTERFACE:include/Airi-Cpp-Server-Lib/timer>
         $<INSTALL_INTERFACE:include/Airi-Cpp-Server-Lib/log>
         $<INSTALL_INTERFACE:include/Airi-Cpp-Server-Lib/http>
+        $<INSTALL_INTERFACE:include/Airi-Cpp-Server-Lib/async>
+        $<INSTALL_INTERFACE:include/Airi-Cpp-Server-Lib/memory>
 )
 
 # 【新增】安装规则（打包输出，支持 find_package(Airi-Cpp-Server-Lib)）
@@ -142,22 +150,51 @@ install(FILES
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/Airi-Cpp-Server-Lib
 )
 
-# 2. Demo / manual-run programs
-add_executable(StressTest src/test/StressTest.cpp)
+# ── 输出目录约定 ──────────────────────────────────────────────
+#   build/examples/   — 面向使用者的演示服务器（http_server、demo_server）
+#   build/tests/      — GoogleTest 二进制（ctest 默认调用）
+#   build/tools/      — 手动运行的测试/压测小工具（需 cmake --build --target ... 显式构建）
+set(MCPP_EXAMPLE_DIR ${CMAKE_BINARY_DIR}/examples)
+set(MCPP_TEST_DIR    ${CMAKE_BINARY_DIR}/tests)
+set(MCPP_TOOL_DIR    ${CMAKE_BINARY_DIR}/tools)
+
+# ── 手动运行的小工具（默认不充入 ALL，不会出现在 build/ 根上）────────
+add_executable(StressTest EXCLUDE_FROM_ALL src/test/StressTest.cpp)
 target_link_libraries(StressTest NetLib pthread)
+set_target_properties(StressTest PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${MCPP_TOOL_DIR})
 
-add_executable(TimerTest src/test/TimerTest.cpp)
+add_executable(TimerTest EXCLUDE_FROM_ALL src/test/TimerTest.cpp)
 target_link_libraries(TimerTest NetLib pthread)
+set_target_properties(TimerTest PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${MCPP_TOOL_DIR})
 
-add_executable(LogTest src/test/LogTest.cpp)
+add_executable(LogTest EXCLUDE_FROM_ALL src/test/LogTest.cpp)
 target_link_libraries(LogTest NetLib pthread)
+set_target_properties(LogTest PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${MCPP_TOOL_DIR})
 
-# 注：性能基准测试不再使用自研客户端，统一改为业界标准 wrk + Docker 真实对照
-# 见 benchmark/muduo_compare/  (跑 wrk 压测，对比 muduo)
+# 海量长连接 / RSS 增长测试（独立可执行，不依赖 NetLib，纯 socket 客户端）
+add_executable(conn_scale_test EXCLUDE_FROM_ALL benchmark/conn_scale_test.cpp)
+set_target_properties(conn_scale_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${MCPP_TOOL_DIR})
 
-# Phase 4 演示服务器
-add_executable(demo_server demo/demo_server.cpp)
-target_link_libraries(demo_server NetLib pthread)
+# ── 主演示服务器（中间件链 / 限流 / 鉴权 / CORS / gzip / 静态文件）────
+add_executable(http_server examples/src/http_server.cpp)
+target_link_libraries(http_server NetLib pthread)
+set_target_properties(http_server PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${MCPP_EXAMPLE_DIR})
+
+# rpc调用示例服务器
+add_executable(rpc_demo examples/src/rpc_demo.cpp)
+target_link_libraries(rpc_demo NetLib pthread)
+set_target_properties(rpc_demo PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${MCPP_EXAMPLE_DIR})
+
+if(ZLIB_FOUND)
+    target_link_libraries(http_server ZLIB::ZLIB)
+    target_compile_definitions(http_server PRIVATE HAS_ZLIB=1)
+endif()
+# 静态资源复制到二进制同级的 examples/，让 ./examples/http_server 在 build/ 下能找到 static/、files/
+add_custom_command(TARGET http_server POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+            ${CMAKE_SOURCE_DIR}/examples/static ${MCPP_EXAMPLE_DIR}/static
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+            ${CMAKE_SOURCE_DIR}/examples/files  ${MCPP_EXAMPLE_DIR}/files)
 
 # ── GoogleTest + CTest ──────────────────────────────────────────
 if(MCPP_ENABLE_TESTING)
@@ -174,11 +211,12 @@ if(MCPP_ENABLE_TESTING)
     enable_testing()
     include(GoogleTest)
 
-    # 辅助函数：注册一个 gtest 可执行文件
+    # 辅助函数：注册一个 gtest 可执行文件到 build/tests/
     function(mcpp_add_test NAME)
         add_executable(${NAME} src/test/${NAME}.cpp)
         target_link_libraries(${NAME} PRIVATE NetLib GTest::gtest_main pthread)
-        gtest_discover_tests(${NAME})
+        set_target_properties(${NAME} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${MCPP_TEST_DIR})
+        gtest_discover_tests(${NAME} WORKING_DIRECTORY ${MCPP_TEST_DIR})
     endfunction()
 
     mcpp_add_test(HttpContextTest)
@@ -188,10 +226,6 @@ if(MCPP_ENABLE_TESTING)
     mcpp_add_test(LogContextTest)
     mcpp_add_test(CorsMiddlewareTest)
     mcpp_add_test(StaticFileHandlerTest)
-    mcpp_add_test(WebSocketTest)
-
-
-
 endif()
 
 # ── 静态分析：clang-tidy（可选 custom target）────────────────────

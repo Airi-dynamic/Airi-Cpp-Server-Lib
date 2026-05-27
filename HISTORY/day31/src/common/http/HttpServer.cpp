@@ -3,7 +3,6 @@
 #include "EventLoop.h"
 #include "http/HttpContext.h"
 #include "http/ServerMetrics.h"
-#include "http/WebSocket.h"
 #include "log/LogContext.h"
 #include "log/Logger.h"
 #include "timer/SteadyClock.h"
@@ -56,7 +55,7 @@ HttpServer::HttpServer(const Options &options) : server_(std::make_unique<TcpSer
              });
 }
 
-void HttpServer::start() { server_->Start(); }
+void HttpServer::start() { server_->start(); }
 void HttpServer::stop() { server_->stop(); }
 
 std::string HttpServer::makeRouteKey(HttpRequest::Method method, const std::string &path) {
@@ -73,14 +72,11 @@ void HttpServer::addPrefixRoute(HttpRequest::Method method, const std::string &p
     prefixRoutes_.push_back(PrefixRoute{method, prefix, std::move(handler)});
 }
 
-void HttpServer::addWebSocketRoute(const std::string &path, WebSocketHandler handler) {
-    wsRoutes_[path] = std::move(handler);
-}
-
 // ── 新连接建立：为每条连接创建独立的 HttpContext ─────────────────────────────
 void HttpServer::onNewConnection(Connection *conn) {
     conn->setContext(HttpConnectionContext{limits_});
-    conn->touchLastActive(); // 记录连接建立时间作为初始活跃时间
+    // 说明：Connection 构造时已初始化 lastActive_（同为 main-reactor 线程上下文），
+    // 此处不再跨线程写该字段，避免与 sub-reactor 上的定时器读取产生数据竞争。
 
     ServerMetrics::instance().onConnectionAccepted();
 
@@ -122,14 +118,6 @@ void HttpServer::onMessage(Connection *conn) {
     if (conn->getState() != Connection::State::kConnected)
         return;
 
-    // WebSocket 模式：数据交给 WebSocket 帧解析器
-    if (conn->getContextAs<WebSocketConnectionContext>()) {
-        if (autoClose_)
-            conn->touchLastActive();
-        ws::handleWebSocketData(conn);
-        return;
-    }
-
     HttpConnectionContext *ctx = conn->getContextAs<HttpConnectionContext>();
     if (!ctx) {
         conn->setContext(HttpConnectionContext{limits_});
@@ -141,9 +129,9 @@ void HttpServer::onMessage(Connection *conn) {
         }
     }
 
-    // 每次收到数据即更新活跃时间（供空闲超时计时器参考）
-    if (autoClose_)
-        conn->touchLastActive();
+    // 说明：活跃时间戳由 Connection::doRead/doWrite 字节级维护，读写任一方向有
+    // 进展都会起新空闲窗口。HTTP 层不再重复 touchLastActive（避免与 doRead
+    // 重复赋值；也保证“长写无入”场景不会被误杀）。
 
     Buffer *buf = conn->getInputBuffer();
     // 关键修复：同一个 TCP 包中可能包含多个 HTTP 请求（pipeline / 粘包）。
@@ -180,6 +168,7 @@ void HttpServer::onMessage(Connection *conn) {
 
         if (consumed > 0) {
             buf->retrieve(static_cast<size_t>(consumed));
+            ServerMetrics::instance().addBytesRead(consumed);
         } else {
             // 理论上 len>0 时应至少消费 1 字节。该保护用于规避异常输入导致的死循环。
             LOG_WARN << "[HttpServer] 解析未前进，等待更多数据，fd=" << conn->getSocket()->getFd();
@@ -201,10 +190,6 @@ void HttpServer::onMessage(Connection *conn) {
 bool HttpServer::onRequest(Connection *conn, const HttpRequest &req) {
     // 设置结构化日志上下文：后续所有 LOG_* 自动携带请求 ID、方法、URL
     LogContext::Guard logGuard(LogContext::nextRequestId(), req.methodString(), req.url());
-
-    // 优先检查是否为 WebSocket 升级请求
-    if (tryWebSocketUpgrade(conn, req))
-        return false; // 连接已切换到 WebSocket 模式，不再走 HTTP 流程
 
     const std::string connHeader = req.header("Connection");
 
@@ -252,57 +237,21 @@ bool HttpServer::onRequest(Connection *conn, const HttpRequest &req) {
     LOG_INFO << "[HttpServer] " << req.methodString() << " " << req.url() << " -> "
              << static_cast<int>(resp.statusCode());
 
-    conn->send(resp.serialize());
+    std::string serialized = resp.serialize();
+    const auto serializedSize = serialized.size();
+    ServerMetrics::instance().addBytesWritten(static_cast<int64_t>(serializedSize));
+    // 使用 move 重载：临时序列化串直接移交给 send，避免一次 std::string 拷贝。
+    conn->send(std::move(serialized));
 
     if (resp.hasSendFile()) {
         conn->sendFile(resp.sendFilePath(), resp.sendFileOffset(), resp.sendFileCount());
+        ServerMetrics::instance().addBytesWritten(static_cast<int64_t>(resp.sendFileCount()));
     }
 
     if (resp.closeConnection()) {
         conn->close();
         return false;
     }
-    return true;
-}
-
-// ── WebSocket 握手处理 ───────────────────────────────────────────────────────
-bool HttpServer::tryWebSocketUpgrade(Connection *conn, const HttpRequest &req) {
-    const std::string &upgrade = req.header("Upgrade");
-    const std::string &connection = req.header("Connection");
-
-    if (!ws::isUpgradeRequest(upgrade, connection))
-        return false;
-
-    // 查找该路径是否注册了 WebSocket 路由
-    auto it = wsRoutes_.find(req.url());
-    if (it == wsRoutes_.end())
-        return false;
-
-    const std::string &wsKey = req.header("Sec-WebSocket-Key");
-    if (wsKey.empty()) {
-        conn->send("HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
-        conn->close();
-        return true;
-    }
-
-    // 计算 Accept Key 并发送 101 响应
-    std::string acceptKey = ws::computeAcceptKey(wsKey);
-    conn->send(ws::buildHandshakeResponse(acceptKey));
-
-    // 将连接上下文切换到 WebSocket 模式
-    WebSocketConnectionContext wsCtx;
-    wsCtx.handler = it->second;
-    conn->setContext(std::move(wsCtx));
-
-    LOG_INFO << "[HttpServer] WebSocket upgrade completed, fd=" << conn->getSocket()->getFd()
-             << " path=" << req.url();
-
-    // 触发 onOpen 回调
-    if (it->second.onOpen) {
-        WebSocketConnection wsConn(conn);
-        it->second.onOpen(wsConn);
-    }
-
     return true;
 }
 

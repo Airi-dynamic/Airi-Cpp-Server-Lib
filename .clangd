@@ -2,11 +2,18 @@
 # 全局编译配置：告诉 clangd 使用 build/ 目录中的 compile_commands.json，
 # 并对未在编译数据库中的文件（如未启用 MCPP_ENABLE_COROUTINES 时的 async/*.h、
 # 未启用 MCPP_ENABLE_IO_URING 时的 io_uring 文件等）提供合理的回退编译参数。
+#
+# ⚠️ 关键修复（Xcode 26 / AppleClang 21 + Homebrew clangd 22）：
+#   Homebrew clangd 默认用自带的 resource-dir（clang/22/include），其中的
+#   <string.h>/<stddef.h> wrapper 与 Apple SDK 的 libc++ v1 不匹配，触发
+#   `<cstring> tried including <string.h> but didn't find libc++'s` 报错。
+#   通过 -resource-dir 显式指向 AppleClang 21 的内建头目录即可解决。
 CompileFlags:
   CompilationDatabase: build
   Add:
     - -std=c++20
     - -Wno-unknown-warning-option
+    - -resource-dir=/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/21
 Index:
   Background: Build
 Diagnostics:
@@ -60,33 +67,3 @@ CompileFlags:
   Add:
     - -std=c++20
     - -DMCPP_HAS_COROUTINES=1
----
-CompileFlags:
-  CompilationDatabase: build
----
-# HISTORY/ 是历史快照，不属于当前项目构建，屏蔽全部诊断
-If:
-  PathExclude: HISTORY/.*
-Diagnostics:
-  Suppress: '*'
----
-# examples/ 有独立的 CMakeLists.txt，不在主 compile_commands.json 中，屏蔽诊断
-If:
-  PathExclude: examples/.*
-Diagnostics:
-  Suppress: '*'
----
-# kqueue 文件仅用于 macOS，在 Linux 上无法编译，屏蔽一切诊断
-# PathMatch 是正则表达式列表，同时覆盖 .cpp 和 .h
-If:
-  PathMatch:
-    - .*/kqueue/.*\.cpp
-    - .*/KqueuePoller\.h
-Diagnostics:
-  Suppress: ['*']
----
-# Airi-Cpp-Server-Lib.h 是伞形头文件，unused include 警告无意义
-If:
-  PathMatch: .*/Airi-Cpp-Server-Lib\.h
-Diagnostics:
-  UnusedIncludes: None

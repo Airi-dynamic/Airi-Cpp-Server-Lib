@@ -55,7 +55,7 @@ HttpServer::HttpServer(const Options &options) : server_(std::make_unique<TcpSer
              });
 }
 
-void HttpServer::start() { server_->Start(); }
+void HttpServer::start() { server_->start(); }
 void HttpServer::stop() { server_->stop(); }
 
 std::string HttpServer::makeRouteKey(HttpRequest::Method method, const std::string &path) {
