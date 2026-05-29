@@ -13,7 +13,7 @@ option(MCPP_ENABLE_UBSAN   "Enable UndefinedBehaviorSanitizer" OFF)
 option(MCPP_ENABLE_COVERAGE "Enable code coverage (gcov / llvm-cov)" OFF)
 
 # C++ 标准
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # ── 第三方依赖：nlohmann/json（vendored 单头文件版本）─────────────
@@ -106,6 +106,7 @@ target_include_directories(NetLib
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include/http>
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include/async>
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include/memory>
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include/coro>
         $<INSTALL_INTERFACE:include/Airi-Cpp-Server-Lib>
         $<INSTALL_INTERFACE:include/Airi-Cpp-Server-Lib/net>
         $<INSTALL_INTERFACE:include/Airi-Cpp-Server-Lib/net/Poller>

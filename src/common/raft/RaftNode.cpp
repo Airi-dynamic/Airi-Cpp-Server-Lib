@@ -1,11 +1,11 @@
-// RaftNode.cpp —— 与本项目 EventLoop 融合的 Raft 选举实现（全异步 RPC 版）
+// RaftNode.cpp —— 与本项目 EventLoop 融合的 Raft 选举实现（协程版）
 //
 // 阅读顺序：
 //   §1 构造 / 析构 / start / stop      —— 线程编排与生命周期
 //   §2 RPC server 回调（fire-and-forget）—— sub-reactor 不再被阻塞
 //   §3 角色切换 + 选举定时器           —— 全部在 loop_ 线程，无锁
-//   §4 选举主流程 startElection         —— 出站走 AsyncRpcClient
-//   §5 心跳                             —— runEvery 回调
+//   §4 选举主流程：runElection + collectVote 协程
+//   §5 心跳：heartbeatTick + sendHeartbeat 协程
 //
 #include "raft/RaftNode.h"
 #include "log/Logger.h"
@@ -237,15 +237,19 @@ void RaftNode::electionTimerFired(uint64_t epoch) {
     if (state_.load() == State::Leader) return;
     // 选举超时 = Leader 失联（可能宕机或网络分区）。转为候选人，发起新一轮选举。
     becomeCandidate();
-    startElection();
+    runElection(); // 为每个 peer 并发发射 collectVote 协程
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// §4  选举主流程：完全异步的 RPC 发射
+// §4  选举主流程：runElection + collectVote 协程
 //
-// 旧版：把 RpcClient::call() 扔到 worker 线程，完成后 queueInLoop 回填。
-// 新版：直接 asyncClient->callAsync(...)，IO + 超时全部在 loop_ 上完成，
-//       回调本就在 loop_ 线程触发，无需手动跨线程切换。
+// 旧版两段式：startElection()（发射 callAsync）+ onVoteReply()（处理回包）。
+// 每个 peer 的"发请求 → 处理回包"逻辑分散在两个函数，调用链为：
+//   electionTimerFired → becomeCandidate → startElection → callAsync → [callback] → onVoteReply
+//
+// 协程版：runElection 为每个 peer 发射一个 collectVote 协程（并发），
+//   每个协程在 co_await callAsyncCo 挂起，响应到达后在 loop_ 线程恢复，
+//   将"发请求"和"处理回包"合并为一段连续的线性代码。
 // ════════════════════════════════════════════════════════════════════════════
 
 AsyncRpcClient *RaftNode::getOrCreateClient(const Peer &peer) {
@@ -257,93 +261,85 @@ AsyncRpcClient *RaftNode::getOrCreateClient(const Peer &peer) {
     return raw;
 }
 
-void RaftNode::startElection() {
-    uint64_t term     = currentTerm_.load();
-    uint64_t lastIdx  = lastLogIndex();
-    uint64_t lastTerm = lastLogTerm();
-
+void RaftNode::runElection() {
+    // 为每个 peer 发射一个 collectVote 协程（并发）。
+    // collectVote 是 FireAndForget：调用后立刻开始执行，到达 co_await callAsyncCo
+    // 时挂起，把 callAsync 派发出去；runElection 不等待它们完成即可返回。
+    uint64_t term = currentTerm_.load();
     for (const auto &peer : peers_) {
         if (peer.id == id_) continue;
-        RequestVoteArgs args{term, id_, lastIdx, lastTerm};
-        std::string     reqJson = json(args).dump();
-        int             peerId  = peer.id;
-
-        AsyncRpcClient *client = getOrCreateClient(peer);
-        client->callAsync("RequestVote", reqJson,
-                          [this, term, peerId](bool ok, std::string respJson) {
-                              RequestVoteReply reply{};
-                              if (ok) {
-                                  try {
-                                      reply = json::parse(respJson).get<RequestVoteReply>();
-                                  } catch (...) { ok = false; }
-                              }
-                              onVoteReply(term, peerId, ok, reply);
-                          },
-                          /*timeoutMs=*/150);
+        collectVote(term, peer);
     }
 }
 
-void RaftNode::onVoteReply(uint64_t electionTerm, int peerId, bool ok, RequestVoteReply reply) {
-    // 守卫①：过期回包过滤。
-    // state_ != Candidate：在等待投票期间收到了更高 term 的消息，已退回 Follower。
-    // currentTerm_ != electionTerm：网络延迟导致的旧选举回包（term 已更新），
-    //   直接丢弃，否则旧票数会累积到新一轮选举里，破坏投票计数的正确性。
-    if (state_.load() != State::Candidate || currentTerm_.load() != electionTerm) return;
-    // ok=false：RPC 超时或网络故障，该节点的投票视为未到，不计入票数。
-    if (!ok) return;
-    // 【Raft 规则 §5.1】回包里的 term 比自己大，说明自己的 term 已过时。
-    // 即使对方投了反对票，也要立刻退位——集群里已经有更新的任期在运行。
+FireAndForget RaftNode::collectVote(uint64_t electionTerm, Peer peer) {
+    // 构造请求（在挂起前，仍在 loop_ 线程）
+    RequestVoteArgs args{electionTerm, id_, lastLogIndex(), lastLogTerm()};
+    std::string reqJson = json(args).dump();
+
+    // ── 挂起点：发出 RPC，等待响应/超时 ────────────────────────────────
+    auto [ok, respJson] = co_await getOrCreateClient(peer)->callAsyncCo(
+        "RequestVote", reqJson, /*timeoutMs=*/150);
+
+    // ── 恢复点（loop_ 线程）────────────────────────────────────────────
+    // 守卫①：在等待期间，节点状态可能已改变（如收到更高 term 退为 Follower）。
+    // 守卫②：currentTerm_ 可能已递增（本轮选举已作废）。
+    // 任一不满足，说明这个回包对当前轮次无效，直接丢弃。
+    if (state_.load() != State::Candidate || currentTerm_.load() != electionTerm) co_return;
+
+    if (!ok) co_return; // RPC 超时或网络故障，忽略
+
+    RequestVoteReply reply{};
+    try {
+        reply = json::parse(respJson).get<RequestVoteReply>();
+    } catch (...) {
+        co_return; // 解码失败，丢弃
+    }
+
+    // 【Raft 规则 §5.1】回包 term 更大：立刻退位
     if (reply.term > currentTerm_.load()) {
         becomeFollower(reply.term);
-        return;
+        co_return;
     }
+
     if (reply.voteGranted) {
         ++currentElectionVotes_;
-        LOG_INFO << "[Node " << id_ << "] 收到节点 " << peerId
+        LOG_INFO << "[Node " << id_ << "] 收到节点 " << peer.id
                  << " 的投票（已得票=" << currentElectionVotes_ << "/" << quorum_ << "）";
-        // 票数达到法定多数（quorum），立刻成为 Leader。
-        // 不等待所有节点回包——Raft 不需要全票，只需多数票即可保证安全性。
         if (currentElectionVotes_ >= quorum_) becomeLeader();
     }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// §5  心跳：每 50ms 一次，仅 Leader 实际广播
+// §5  心跳：heartbeatTick + sendHeartbeat 协程
 // ════════════════════════════════════════════════════════════════════════════
 
 void RaftNode::heartbeatTick() {
-    // runEvery 每 50ms 无条件触发，但只有 Leader 才实际广播。
-    // Follower/Candidate 走到这里直接返回，零开销。
     if (state_.load() != State::Leader) return;
-    uint64_t term = currentTerm_.load();
-
     for (const auto &peer : peers_) {
         if (peer.id == id_) continue;
-        AppendEntriesArgs args{term, id_};
-        std::string       reqJson = json(args).dump();
-        int               peerId  = peer.id;
-
-        AsyncRpcClient *client = getOrCreateClient(peer);
-        client->callAsync("AppendEntries", reqJson,
-                          [this, peerId](bool ok, std::string respJson) {
-                              AppendEntriesReply reply{};
-                              if (ok) {
-                                  try {
-                                      reply = json::parse(respJson).get<AppendEntriesReply>();
-                                  } catch (...) { ok = false; }
-                              }
-                              onHeartbeatReply(peerId, ok, reply);
-                          },
-                          /*timeoutMs=*/100);
+        sendHeartbeat(peer); // 并发发射，每个 peer 独立协程
     }
 }
 
-void RaftNode::onHeartbeatReply(int /*peerId*/, bool ok, AppendEntriesReply reply) {
-    // 超时或网络故障：忽略。Leader 会在下一个 50ms 周期重发心跳，容错处理。
-    if (!ok) return;
-    // 回包 term 更大：说明集群已选出更新任期的 Leader，自己是「僵尸 Leader」。
-    // 立刻退位，避免出现两个 Leader 同时运作（脑裂）。
-    if (reply.term > currentTerm_.load()) becomeFollower(reply.term);
+FireAndForget RaftNode::sendHeartbeat(Peer peer) {
+    AppendEntriesArgs args{currentTerm_.load(), id_};
+    std::string reqJson = json(args).dump();
+
+    // ── 挂起点 ──────────────────────────────────────────────────────────
+    auto [ok, respJson] = co_await getOrCreateClient(peer)->callAsyncCo(
+        "AppendEntries", reqJson, /*timeoutMs=*/100);
+
+    // ── 恢复点（loop_ 线程）────────────────────────────────────────────
+    if (!ok) co_return; // 超时或网络故障：下一个 50ms 周期重试
+
+    try {
+        auto reply = json::parse(respJson).get<AppendEntriesReply>();
+        // 回包 term 更大：自己是"僵尸 Leader"，立刻退位
+        if (reply.term > currentTerm_.load()) becomeFollower(reply.term);
+    } catch (...) {
+        // 解码失败，忽略
+    }
 }
 
 uint64_t RaftNode::lastLogIndex() const { return static_cast<uint64_t>(log_.size() - 1); }

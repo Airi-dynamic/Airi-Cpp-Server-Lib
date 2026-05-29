@@ -168,6 +168,7 @@ void TcpServer::newConnection(int fd) {
     // 先注入所有回调，再通过 queueInLoop 在归属 sub-reactor 线程启用 Channel，
     // 避免 Channel 就绪触发事件时回调尚未设置
     conn->setOnMessageCallback(onMessageCallback_);
+    conn->enableMessageMode(); // 显式切换到"读取+业务回调"模式
     conn->setDeleteConnectionCallback(
         std::bind(&TcpServer::deleteConnection, this, std::placeholders::_1));
 

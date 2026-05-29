@@ -59,7 +59,7 @@ Eventloop::Eventloop() : poller_(nullptr), quit_(false), tid_(std::this_thread::
     evtChannel_ = std::make_unique<Channel>(this, wakeupReadFd_);
 #endif
 
-    evtChannel_->setReadCallback(std::bind(&Eventloop::handleWakeup, this));
+    evtChannel_->setReadCallback([this] { handleWakeup(); });
     evtChannel_->enableReading();
     // 唤醒 channel 不启用 ET，用 LT，确保每次都能被读到
 }

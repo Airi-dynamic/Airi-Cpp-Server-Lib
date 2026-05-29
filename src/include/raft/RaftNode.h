@@ -1,6 +1,6 @@
 #pragma once
 //
-// RaftNode —— 基于本项目 EventLoop 的 Raft 节点（全异步 RPC 版）
+// RaftNode —— 基于本项目 EventLoop 的 Raft 节点（全异步 RPC + C++20 协程版）
 //
 // 设计要点：
 //   1. 每个 RaftNode 持有一个自己的 Eventloop（loop_），跑在独立线程 loopThread_。
@@ -18,16 +18,16 @@
 //      handler 立刻把"处理 + done(payload)"投递到 loop_ 线程并返回，
 //      sub-reactor 永不被同步阻塞。
 //
-//   5. 出站 RPC（全异步）：
-//      每个 peer 维护一个 AsyncRpcClient，复用 loop_ 做 IO。
-//      callAsync 立刻返回；响应/超时通过回调在 loop_ 线程触发。
-//      由此彻底删除旧版同步 RpcClient + worker 线程池：
-//      网络抖动不再占用 CPU 线程，超时由 EventLoop 定时器零阻塞处理。
+//   5. 出站 RPC（协程版）：
+//      collectVote / sendHeartbeat 是 FireAndForget 协程，在 loop_ 线程启动后
+//      立刻挂起于 co_await callAsyncCo(...)，等待网络响应/超时后在 loop_ 线程
+//      恢复执行。彻底消除旧版"startElection + onVoteReply 两段式跳板"。
 //
 // 外部只读访问（getCurrentTerm / getState / isLeader）通过 std::atomic 字段
 // 暴露，调用方无需进入 loop_ 线程也能拿到一致快照。
 //
 #include "EventLoop.h"
+#include "coro/Task.h"
 #include "raft/RaftTypes.h"
 #include "rpc/AsyncRpcClient.h"
 #include "rpc/RpcServer.h"
@@ -76,11 +76,19 @@ class RaftNode {
     void resetElectionTimer();
     void electionTimerFired(uint64_t epoch);
 
-    void startElection();
-    void onVoteReply(uint64_t electionTerm, int peerId, bool ok, RequestVoteReply reply);
-
+    // 选举主流程：为每个 peer 发射一个 collectVote 协程（并发收票）
+    void runElection();
+    // 心跳主循环：为每个 peer 发射一个 sendHeartbeat 协程
     void heartbeatTick();
-    void onHeartbeatReply(int peerId, bool ok, AppendEntriesReply reply);
+
+    // ── 协程方法（FireAndForget，在 loop_ 线程启动并挂起）─────────────
+    // collectVote: 向 peer 发送 RequestVote RPC，处理回包并更新投票计数。
+    // 等效于旧版 startElection 中的 callAsync lambda + onVoteReply()。
+    FireAndForget collectVote(uint64_t electionTerm, Peer peer);
+
+    // sendHeartbeat: 向 peer 发送 AppendEntries(心跳) RPC，处理 term 退位。
+    // 等效于旧版 heartbeatTick 中的 callAsync lambda + onHeartbeatReply()。
+    FireAndForget sendHeartbeat(Peer peer);
 
     uint64_t lastLogIndex() const;
     uint64_t lastLogTerm() const;
@@ -117,3 +125,4 @@ class RaftNode {
 };
 
 } // namespace raft
+

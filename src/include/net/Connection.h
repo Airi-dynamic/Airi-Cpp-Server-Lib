@@ -86,6 +86,12 @@ class Connection {
     void Write();
     void Business(); // Read() 后调用 on_message_callback_
 
+    // 切换到"业务模式"：把 channel_ 的 read 回调设为 Business()。
+    // 必须在 setOnMessageCallback() 之后、enableInLoop() 之前显式调用。
+    // 设计原因：setOnMessageCallback 故意只存回调，不产生隐式副作用；
+    //           通过此方法让"切换读模式"的意图在调用处一目了然。
+    void enableMessageMode();
+
     Socket *getSocket();
     State getState() const;
     Buffer *getInputBuffer();

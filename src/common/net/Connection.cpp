@@ -31,8 +31,8 @@
 Connection::Connection(int fd, Eventloop *loop)
     : loop_(loop), sock_(std::make_unique<Socket>(fd)), channel_(nullptr) {
     channel_ = std::make_unique<Channel>(loop_, sock_->getFd());
-    channel_->setReadCallback(std::bind(&Connection::doRead, this));
-    channel_->setWriteCallback(std::bind(&Connection::doWrite, this));
+    channel_->setReadCallback([this] { doRead(); });
+    channel_->setWriteCallback([this] { doWrite(); });
     // 不在构造函数中 enableReading / enableET，
     // 由 TcpServer::newConnection 设置好所有回调后，通过 enableInLoop() 启用
     state_ = State::kConnected;
@@ -631,8 +631,15 @@ void Connection::setOnConnectCallback(std::function<void(Connection *)> const &_
 }
 
 void Connection::setOnMessageCallback(std::function<void(Connection *)> const &cb) {
+    // 只存储回调，不产生任何副作用。
+    // 切换 channel_ 的读模式必须通过 enableMessageMode() 显式完成。
     onMessageCallback_ = cb;
-    channel_->setReadCallback(std::bind(&Connection::Business, this));
+}
+
+void Connection::enableMessageMode() {
+    // 将 channel_ 的 read 回调切为 Business()，开启「读取 + 业务回调」模式。
+    // 必须在 setOnMessageCallback 设好回调后、enableInLoop 之前调用。
+    channel_->setReadCallback([this] { Business(); });
 }
 
 void Connection::enableInLoop() {

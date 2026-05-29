@@ -205,6 +205,7 @@ void AsyncRpcClient::onConnected(int fd) {
         loop_->queueInLoop([this] { handleConnectionClosed(); });
     });
     conn_->setOnMessageCallback([this](Connection *c) { onResponse(c); });
+    conn_->enableMessageMode(); // 显式切换到 Business() 读模式
     conn_->enableInLoop();
 
     flushPendingFrames();
@@ -307,4 +308,42 @@ void AsyncRpcClient::completeWithTimeout(uint32_t reqId, uint64_t /*timerEpoch*/
     Callback cb = std::move(it->second.cb);
     pending_.erase(it);
     if (cb) cb(false, "");
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// §6 协程出口：RpcCallAwaiter + callAsyncCo
+// ════════════════════════════════════════════════════════════════════════════
+
+// callAsyncCo — 构造 RpcCallAwaiter 并返回（工厂函数）。
+// 不需要在 loop_ 线程调用（callAsync 内部已 runInLoop）。
+RpcCallAwaiter AsyncRpcClient::callAsyncCo(const std::string &method,
+                                            const std::string &requestJson,
+                                            int timeoutMs) {
+    return RpcCallAwaiter{this, method, requestJson, timeoutMs};
+}
+
+// RpcCallAwaiter::await_suspend — co_await 的挂起入口。
+//
+// 调用时序：
+//   1. 协程在 co_await 处被编译器挂起（帧已保存），await_suspend(h) 被调用。
+//   2. 向 callAsync 注册 callback lambda，lambda 捕获：
+//      - this：RpcCallAwaiter* （存储在协程帧上，帧存活时安全）
+//      - h   ：std::coroutine_handle<> （拷贝廉价，句柄是个指针）
+//   3. callAsync 立刻返回，await_suspend 返回 void（协程继续挂起）。
+//   4. 当 RPC 响应到达（或超时），callback 在 loop_ 线程触发：
+//      先写 ok_/resp_（帧存活），再 h.resume()。
+//   5. h.resume() 内部调用 await_resume()，取出 {ok_, resp_} 作为 co_await 结果。
+//
+void RpcCallAwaiter::await_suspend(std::coroutine_handle<> h) {
+    client_->callAsync(
+        method_, json_,
+        [this, h](bool ok, std::string resp) mutable {
+            // callback 在 loop_ 线程触发（callAsync 约定）。
+            // 写入结果到协程帧（写在 resume 之前，保证 await_resume 可见）。
+            ok_   = ok;
+            resp_ = std::move(resp);
+            // 恢复协程：也在 loop_ 线程，维持 single-thread invariant。
+            h.resume();
+        },
+        timeoutMs_);
 }

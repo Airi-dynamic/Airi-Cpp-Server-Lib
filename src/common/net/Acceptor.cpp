@@ -36,7 +36,7 @@ Acceptor::Acceptor(Eventloop *loop, const char *ip, uint16_t port) {
 
     acceptChannel_ = std::make_unique<Channel>(loop, sock_->getFd());
     // 只要有新连接请求，Channel 就会调用我们注册的 acceptConnection
-    acceptChannel_->setReadCallback(std::bind(&Acceptor::acceptConnection, this));
+    acceptChannel_->setReadCallback([this] { acceptConnection(); });
     // 注意：Acceptor 不使用 ET 模式，避免多个连接同时到达时只 accept 一次导致丢连接
     acceptChannel_->enableReading();
 }
