@@ -5,7 +5,7 @@
 
 > **方向说明（2026-05-27）**：day31–day36 为未实施的旧规划（WebSocket / 协程 / io_uring /
 > 无锁队列 / 内存池 / muduo 对比），对应的 HISTORY/day31-36/ 快照保留作为"曾考虑路线"。
-> **自 day37 起，项目转向分布式存储方向**（Raft 共识 + 自研 LSM-Tree + 分布式 KV），
+> **自 day31 起，项目转向分布式存储方向**（Raft 共识 + 自研 LSM-Tree + 分布式 KV），
 > 详见 AGENT_MEMORY/PLAN.md。
 
 ---

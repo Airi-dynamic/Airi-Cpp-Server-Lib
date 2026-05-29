@@ -1,4 +1,4 @@
-# Airi-Cpp-Server-Lib · 分布式存储速成计划（Day37–Day43）
+# Airi-Cpp-Server-Lib · 分布式存储速成计划（Day31–Day37）
 
 ## 目标
 1 周内基于现有 C++ NetLib 构建：
@@ -14,25 +14,25 @@
 
 | Day | 主题 | 理论锚点 | 核心工程交付 |
 |-----|------|----------|------------|
-| 37 | RPC 基础层 | CAP、quorum、leader-based | RpcMessage / RpcServer / RpcClient，基于 TcpServer |
-| 38 | Raft 选举 | term、随机超时、投票规则、split vote | RaftNode 三角色状态机、RequestVote RPC |
-| 39 | Raft 日志复制 | log 一致性检查、commitIndex、Figure 8 | AppendEntries、log[]、nextIndex/matchIndex |
-| 40 | Raft 持久化 + Snapshot | currentTerm/votedFor/log 持久化、log compaction | Storage 模块、InstallSnapshot RPC |
-| 41 | LSM-Tree 单机引擎 | 写/读/空间放大、WAL、Bloom、Compaction | MemTable + WAL + SSTable + LsmEngine |
-| 42 | Raft + LSM 集成 | 复制状态机、ReadIndex 线性一致读 | dist_kv_server / client、HTTP /kv/* |
-| 43 | 故障注入 + 监控 + 面试 | 脑裂、慢盘、Compaction 阻塞 | chaos.sh、Prometheus raft/lsm 指标、INTERVIEW_NOTES |
+| 31 | RPC 基础层 | CAP、quorum、leader-based | RpcMessage / RpcServer / RpcClient，基于 TcpServer |
+| 32 | Raft 选举 | term、随机超时、投票规则、split vote | RaftNode 三角色状态机、RequestVote RPC |
+| 33 | Raft 日志复制 | log 一致性检查、commitIndex、Figure 8 | AppendEntries、log[]、nextIndex/matchIndex |
+| 34 | Raft 持久化 + Snapshot | currentTerm/votedFor/log 持久化、log compaction | Storage 模块、InstallSnapshot RPC |
+| 35 | LSM-Tree 单机引擎 | 写/读/空间放大、WAL、Bloom、Compaction | MemTable + WAL + SSTable + LsmEngine |
+| 36 | Raft + LSM 集成 | 复制状态机、ReadIndex 线性一致读 | dist_kv_server / client、HTTP /kv/* |
+| 37 | 故障注入 + 监控 + 面试 | 脑裂、慢盘、Compaction 阻塞 | chaos.sh、Prometheus raft/lsm 指标、INTERVIEW_NOTES |
 
 ---
 
 ## 进度追踪
 
-- [ ] Day37 — RPC 基础层
-- [ ] Day38 — Raft 选举
-- [ ] Day39 — Raft 日志复制
-- [ ] Day40 — Raft 持久化 + Snapshot
-- [ ] Day41 — LSM-Tree 单机引擎
-- [ ] Day42 — Raft + LSM 集成
-- [ ] Day43 — 故障注入 + 监控 + 面试冲刺
+- [x] Day31 — RPC 基础层
+- [ ] Day32 — Raft 选举
+- [ ] Day33 — Raft 日志复制
+- [ ] Day34 — Raft 持久化 + Snapshot
+- [ ] Day35 — LSM-Tree 单机引擎
+- [ ] Day36 — Raft + LSM 集成
+- [ ] Day37 — 故障注入 + 监控 + 面试冲刺
 
 ---
 

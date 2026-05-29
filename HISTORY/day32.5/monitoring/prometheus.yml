@@ -1,0 +1,13 @@
+global:
+  scrape_interval: 5s       # 每 5 秒采集一次
+
+scrape_configs:
+  - job_name: "airi-cpp-server"
+    static_configs:
+      - targets: ["host.docker.internal:18888"]   # macOS 宿主机
+    metrics_path: /metrics
+
+  - job_name: "node-exporter"
+    static_configs:
+      - targets: ["host.docker.internal:9100"]    # host 上 brew 启动的 node_exporter
+    metrics_path: /metrics
