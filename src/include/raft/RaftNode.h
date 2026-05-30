@@ -2,29 +2,12 @@
 //
 // RaftNode —— 基于本项目 EventLoop 的 Raft 节点（全异步 RPC + C++20 协程版）
 //
-// 设计要点：
-//   1. 每个 RaftNode 持有一个自己的 Eventloop（loop_），跑在独立线程 loopThread_。
-//      所有 Raft 状态（currentTerm_/votedFor_/log_/state_/...）只在 loop_ 线程
-//      读写 → 完全无锁。
-//
-//   2. 选举定时器 = loop_->runAfter(timeoutSec, lambda{epoch})。
-//      "取消"通过 epoch 版本号实现：每次 reset 时 ++electionEpoch_，
-//      旧 lambda 触发时发现 epoch 不匹配自行 return。
-//
-//   3. 心跳 = loop_->runEvery(0.05, ...)，回调内自检 state_ == Leader 才广播。
-//
-//   4. 入站 RPC（fire-and-forget）：
-//      RpcServer 在自己的 sub-reactor 线程回调 handler(req, done)。
-//      handler 立刻把"处理 + done(payload)"投递到 loop_ 线程并返回，
-//      sub-reactor 永不被同步阻塞。
-//
-//   5. 出站 RPC（协程版）：
-//      collectVote / sendHeartbeat 是 FireAndForget 协程，在 loop_ 线程启动后
-//      立刻挂起于 co_await callAsyncCo(...)，等待网络响应/超时后在 loop_ 线程
-//      恢复执行。彻底消除旧版"startElection + onVoteReply 两段式跳板"。
-//
-// 外部只读访问（getCurrentTerm / getState / isLeader）通过 std::atomic 字段
-// 暴露，调用方无需进入 loop_ 线程也能拿到一致快照。
+// Day33 新增：
+//   - AppendEntries 携带真实日志条目（prevLogIndex/prevLogTerm/entries/leaderCommit）
+//   - Leader 维护 nextIndex_[]/matchIndex_[] per-peer 追踪状态
+//   - commitIndex / lastApplied + applyCallback（复制状态机）
+//   - sendHeartbeat → replicateLog（心跳与复制合一）
+//   - propose(cmd)：外部写入接口（线程安全，内部 runInLoop）
 //
 #include "EventLoop.h"
 #include "coro/Task.h"
@@ -32,6 +15,7 @@
 #include "rpc/AsyncRpcClient.h"
 #include "rpc/RpcServer.h"
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <random>
 #include <string>
@@ -57,11 +41,29 @@ class RaftNode {
     // 幂等：停止所有线程并 join。
     void stop();
 
-    // 外部线程可调用的只读快照（基于 atomic，无锁）
+    // ── 外部只读快照（基于 atomic，无锁，可从任意线程调用）────────────
     State    getState() const { return state_.load(); }
     uint64_t getCurrentTerm() const { return currentTerm_.load(); }
     bool     isLeader() const { return state_.load() == State::Leader; }
     int      getId() const { return id_; }
+    uint64_t getCommitIndex() const { return commitIndex_.load(); }
+    uint64_t getLastApplied() const { return lastApplied_.load(); }
+    int      getLeaderId() const { return leaderId_; }  // -1 = 未知
+    uint64_t getLastLogIndex() const {
+        // 仅近似值（loop_ 线程外读 log_ 可能不精确），仅供展示用
+        return static_cast<uint64_t>(log_.size()) - 1;
+    }
+
+    // ── 写入接口（线程安全：内部 runInLoop 投递到 loop_ 线程）─────────
+    // 若当前节点不是 Leader，命令被丢弃（真实系统应转发给 Leader）。
+    // 返回时命令已入队（异步执行），不等待提交完成。
+    void propose(const std::string &cmd);
+
+    // ── 状态机回调（必须在 start() 之前注册）────────────────────────────
+    // 当 lastApplied 推进时，在 loop_ 线程回调 cb(index, cmd)。
+    void setApplyCallback(std::function<void(uint64_t, const std::string &)> cb) {
+        applyCallback_ = std::move(cb);
+    }
 
   private:
     // ── RPC server 回调（由 sub-reactor 线程调用，内部异步投递到 loop_）──
@@ -76,19 +78,20 @@ class RaftNode {
     void resetElectionTimer();
     void electionTimerFired(uint64_t epoch);
 
-    // 选举主流程：为每个 peer 发射一个 collectVote 协程（并发收票）
-    void runElection();
-    // 心跳主循环：为每个 peer 发射一个 sendHeartbeat 协程
-    void heartbeatTick();
-
-    // ── 协程方法（FireAndForget，在 loop_ 线程启动并挂起）─────────────
-    // collectVote: 向 peer 发送 RequestVote RPC，处理回包并更新投票计数。
-    // 等效于旧版 startElection 中的 callAsync lambda + onVoteReply()。
+    // 选举：为每个 peer 发射 collectVote 协程（并发收票）
+    void          runElection();
     FireAndForget collectVote(uint64_t electionTerm, Peer peer);
 
-    // sendHeartbeat: 向 peer 发送 AppendEntries(心跳) RPC，处理 term 退位。
-    // 等效于旧版 heartbeatTick 中的 callAsync lambda + onHeartbeatReply()。
-    FireAndForget sendHeartbeat(Peer peer);
+    // 日志复制 + 心跳合一：每次心跳 = 一次 replicateLog
+    // 无新条目时 entries=[] 作为心跳；有新条目时附带日志段
+    void          heartbeatTick();
+    FireAndForget replicateLog(Peer peer);
+
+    // 提交推进：Leader 在 matchIndex 更新后调用
+    // 找到满足「多数 matchIndex[i] >= N 且 log[N].term == currentTerm」的最大 N
+    void advanceCommitIndex();
+    // 应用已提交但尚未 apply 的条目（lastApplied → commitIndex）
+    void applyCommitted();
 
     uint64_t lastLogIndex() const;
     uint64_t lastLogTerm() const;
@@ -104,11 +107,22 @@ class RaftNode {
     // ── Raft 状态（只在 loop_ 线程读写；外部只读字段额外用 atomic 暴露）──
     std::atomic<uint64_t> currentTerm_{0};
     int                   votedFor_{-1};
-    std::vector<LogEntry> log_;
+    std::vector<LogEntry> log_;           // log_[0] 是哨兵条目（term=0）
     std::atomic<State>    state_{State::Follower};
     int                   leaderId_{-1};
     int                   currentElectionVotes_{0};
     uint64_t              electionEpoch_{0};
+
+    // ── 日志复制状态 ────────────────────────────────────────────────────
+    std::atomic<uint64_t> commitIndex_{0};  // 已提交的最高 index
+    std::atomic<uint64_t> lastApplied_{0};  // 已应用到状态机的最高 index
+
+    // Leader 专属（仅在 loop_ 线程访问，becomeLeader 初始化，角色切换后可能过时）
+    std::unordered_map<int, uint64_t> nextIndex_;   // peer.id → 下次发送的 index
+    std::unordered_map<int, uint64_t> matchIndex_;  // peer.id → 已确认复制的最高 index
+
+    // 状态机回调：commit 推进时在 loop_ 线程回调
+    std::function<void(uint64_t, const std::string &)> applyCallback_;
 
     // ── 基础设施 ────────────────────────────────────────────────────────
     Eventloop         loop_;
@@ -125,4 +139,5 @@ class RaftNode {
 };
 
 } // namespace raft
+
 

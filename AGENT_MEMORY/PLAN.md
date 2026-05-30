@@ -27,8 +27,8 @@
 ## 进度追踪
 
 - [x] Day31 — RPC 基础层
-- [ ] Day32 — Raft 选举
-- [ ] Day33 — Raft 日志复制
+- [x] Day32 — Raft 选举（含 Day32.5 C++20 协程重构）
+- [x] Day33 — Raft 日志复制
 - [ ] Day34 — Raft 持久化 + Snapshot
 - [ ] Day35 — LSM-Tree 单机引擎
 - [ ] Day36 — Raft + LSM 集成

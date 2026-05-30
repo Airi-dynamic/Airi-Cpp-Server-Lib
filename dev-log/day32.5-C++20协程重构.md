@@ -763,3 +763,148 @@ day33 原计划：探索 **io_uring 后端**（Linux 专属高性能 IO）。
 - io_uring 的 completion queue 完全可以被封装成 awaitable（`IoUringSqeAwaiter`）；
 - 将来 `read`/`write` 可以直接 `co_await ioUringRead(fd, buf, len)` — 和 `callAsyncCo` 一个风格；
 - 没有协程的情况下，io_uring 的回调链会比 epoll/kqueue 更难管理，协程正好消解这一复杂度。
+
+---
+
+## 10. 协程帧的内存模型：续体（Continuation）在哪里？
+
+> 本节回答一个常见的认知盲点：
+> "在回调写法中，我能清楚地看到闭包对象存在于内存中。切换到协程写法后，
+> `runElection` 返回、函数栈帧销毁，我却感觉后续的处理'消失了'，
+> 保证后续正常运转的机制到底在哪里？"
+
+### 10.1 调用 collectVote 时，编译器做了什么
+
+`collectVote(term, peer)` 看起来像一次普通函数调用，但编译器对含有 `co_await` 的函数特殊处理。
+大致等价于以下伪代码：
+
+```cpp
+// 编译器实际生成的逻辑（简化）
+FireAndForget collectVote(uint64_t electionTerm, Peer peer) {
+    // ① 在堆上分配协程帧
+    auto *frame = operator new(sizeof(CollectVote_Frame));
+    // ② 把函数参数拷贝进帧（而不是放在调用方的栈上）
+    frame->electionTerm = electionTerm;
+    frame->peer         = peer;
+    // ③ 构造 promise，生成返回对象（FireAndForget{}，空壳）
+    frame->promise.get_return_object();  // → FireAndForget{}
+    // ④ initial_suspend = suspend_never → 立刻开始执行函数体
+    // （从这里开始，执行的是协程帧内的状态机）
+    frame->execute();   // 运行到第一个 co_await，挂起
+    // ⑤ 把 FireAndForget{} 返回给调用方（runElection 把它丢掉）
+    return FireAndForget{};
+}
+```
+
+**关键点**：函数参数 `electionTerm`、`peer` 以及所有局部变量（`args`、`reqJson` 等）
+全部存在**堆上**的协程帧中，而不是调用方的栈帧上。
+`runElection` 的栈帧返回后，协程帧纹丝不动，静静躺在堆里。
+
+### 10.2 co_await 挂起时的内存快照
+
+```
+运行到 co_await getOrCreateClient(peer)->callAsyncCo(...) 时：
+
+堆内存（协程帧，peer0）:
+┌───────────────────────────────────────────────────────┐
+│  CollectVote_Frame                                    │
+│  ├─ electionTerm = 1           ← 拷贝自函数参数       │
+│  ├─ peer         = {id=0,...}  ← 拷贝自函数参数       │
+│  ├─ args         = {...}       ← 局部变量             │
+│  ├─ reqJson      = "{...}"     ← 局部变量             │
+│  ├─ __resume_point = LABEL_1   ← 编译器写入，标记恢复点 │
+│  └─ RpcCallAwaiter (co_await 表达式的临时对象，帧内):  │
+│       ├─ client_ = &peerClients_[0]                   │
+│       ├─ ok_     = false       ← callback 将写入这里  │
+│       └─ resp_   = ""          ← callback 将写入这里  │
+└───────────────────────────────────────────────────────┘
+         ↑
+         h（std::coroutine_handle<>，本质是 8 字节指针）
+         被 lambda 按值捕获，存入：
+         AsyncRpcClient::pending_[reqId].cb
+```
+
+`await_suspend(h)` 的实现：
+
+```cpp
+void RpcCallAwaiter::await_suspend(std::coroutine_handle<> h) {
+    client_->callAsync(method_, json_,
+        [this, h](bool ok, std::string resp) mutable {
+            ok_   = ok;            // 写入协程帧内的 RpcCallAwaiter::ok_
+            resp_ = std::move(resp);
+            h.resume();            // h 指向协程帧，恢复执行
+        }, timeoutMs_);
+    // callAsync 立刻返回，await_suspend 返回，协程挂起
+    // 控制权回到 runElection，runElection 继续为下一个 peer 发射协程
+}
+```
+
+### 10.3 "后续保障"的完整内存链
+
+```
+RaftNode
+  └─ peerClients_[peerId]               （std::unique_ptr<AsyncRpcClient>）
+       └─ AsyncRpcClient::pending_[reqId]  （std::unordered_map）
+            └─ PendingCall::cb             （std::function<void(bool,string)>）
+                 = lambda [this=&awaiter, h=coroutine_handle]
+                              │
+                              └─ h 是指向协程帧的 8 字节指针
+                                   └─ 协程帧（堆对象）
+                                        ├─ electionTerm, peer, args, reqJson
+                                        ├─ __resume_point（恢复后从哪里执行）
+                                        └─ RpcCallAwaiter { ok_, resp_ }
+```
+
+这个链条就是"后续保障"的真实存在形式：
+只要 `pending_[reqId].cb` 活着（RPC 未超时未响应），协程帧就不会被释放，
+所有上下文数据都完整保存在帧里。
+
+### 10.4 回包到达时，恢复流程
+
+```
+TCP 收包
+  └─ Connection::onMessage()
+       └─ AsyncRpcClient::onResponse()
+            └─ pending_[reqId].cb(true, payload)   ← 找到 lambda
+                 ├─ awaiter.ok_   = true            ← 写协程帧字段
+                 ├─ awaiter.resp_ = payload         ← 写协程帧字段
+                 └─ h.resume()                      ← 从 __resume_point 继续执行
+                      └─ 编译器生成的状态机跳转到 LABEL_1
+                           └─ await_resume() → 返回 {ok_, resp_}
+                                └─ auto [ok, respJson] = {true, payload}
+                                     └─ 协程体恢复执行，electionTerm/peer 全在帧里
+```
+
+### 10.5 协程帧 vs 回调闭包：两者的本质相同
+
+| | 旧版回调写法 | 协程写法 |
+|--|--|--|
+| "后续保障"的具体对象 | 程序员手写的 lambda，捕获 `term`、`peerId`，存入 `pending_[reqId].cb` | 编译器生成的协程帧（堆对象），地址以 `h` 的形式存入 `pending_[reqId].cb` |
+| 保存了哪些上下文 | 显式捕获列表里的变量 | 函数体内所有局部变量（编译器自动提升到帧） |
+| 恢复/调用方式 | `cb(true, payload)` 直接调用 lambda | `h.resume()` → 状态机跳转 → `await_resume()` |
+| 谁负责释放 | `cb` 析构时捕获副本一起释放 | 协程运行到 `co_return` / 末尾 → `final_suspend=suspend_never` → 帧自动 delete |
+| 本质 | 一块堆内存 + 函数指针 | 一块堆内存 + 函数指针（状态机入口） |
+
+**结论**：协程帧 = 编译器自动生成的闭包。
+区别仅在于：回调需要程序员显式写出捕获列表，协程让编译器自动完成这件事。
+`pending_[reqId].cb` 里捕获的 `h`，正是把"闭包对象地址"和"协程帧地址"等价起来的那根指针。
+
+### 10.6 协程帧何时销毁
+
+`FireAndForget` 的 `final_suspend = suspend_never`：
+
+```
+协程运行到 co_return（或函数末尾）
+  → 编译器调用 promise.final_suspend() → 返回 suspend_never
+  → 协程不挂起，立刻销毁帧
+  → operator delete(frame)
+```
+
+| 路径 | 触发销毁的位置 |
+|--|--|
+| RPC 成功，voteGranted=true，已达 quorum | `becomeLeader()` 之后自然到达函数末尾 |
+| RPC 成功，守卫不通过 | `co_return` 处 |
+| RPC 超时 / 网络故障（ok=false） | `if (!ok) co_return;` 处 |
+| 停机（`peerClients_.clear()`） | `failAllPending()` → callback(false,"") → `h.resume()` → `if(!ok) co_return;` |
+
+**无论哪条路径，帧都保证被销毁，没有泄漏。**

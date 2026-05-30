@@ -140,3 +140,4 @@ benchmark/instruments/*
 benchmark/flamegraph/*
 !benchmark/flamegraph/.gitkeep
 !benchmark/flamegraph/sample_wrk30s.txt
+HISTORY

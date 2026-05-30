@@ -1,11 +1,13 @@
-// RaftNode.cpp —— 与本项目 EventLoop 融合的 Raft 选举实现（协程版）
+// RaftNode.cpp —— Raft 共识节点（选举 + 日志复制 + C++20 协程）
 //
 // 阅读顺序：
 //   §1 构造 / 析构 / start / stop      —— 线程编排与生命周期
 //   §2 RPC server 回调（fire-and-forget）—— sub-reactor 不再被阻塞
 //   §3 角色切换 + 选举定时器           —— 全部在 loop_ 线程，无锁
-//   §4 选举主流程：runElection + collectVote 协程
-//   §5 心跳：heartbeatTick + sendHeartbeat 协程
+//   §4 选举：runElection + collectVote 协程
+//   §5 日志复制 + 心跳：heartbeatTick + replicateLog 协程
+//   §6 提交推进：advanceCommitIndex + applyCommitted
+//   §7 外部写入接口：propose
 //
 #include "raft/RaftNode.h"
 #include "log/Logger.h"
@@ -145,30 +147,74 @@ void RaftNode::handleAppendEntries(const std::string &reqJson, RpcServer::Done d
     try {
         args = json::parse(reqJson).get<AppendEntriesArgs>();
     } catch (...) {
-        done(R"({"term":0,"success":false})");
+        done(R"({"term":0,"success":false,"conflictIndex":0,"conflictTerm":0})");
         return;
     }
 
     loop_.runInLoop([this, args, done = std::move(done)]() mutable {
-        // 同 RequestVote：看到更高 term 立刻退位。
         if (args.term > currentTerm_.load()) becomeFollower(args.term);
 
-        bool success = false;
-        // 【Raft 规则 §5.2】只接受 term >= 当前 term 的 AppendEntries。
-        // term 过时的心跳说明发送方是被淘汰的旧 Leader，直接拒绝（success=false）。
-        // 拒绝时回包里携带 currentTerm_，让旧 Leader 知道自己已落后，从而退位。
-        if (args.term >= currentTerm_.load()) {
-            // 收到合法 Leader 的心跳，强制确认自己是 Follower。
-            // 即使我是 Candidate（正在拉票），也必须承认已有合法 Leader 存在，放弃选举。
-            state_.store(State::Follower);
-            leaderId_ = args.leaderId;  // 记录当前 Leader，方便客户端重定向
-            success   = true;
-            // 【关键】重置选举计时器：收到 Leader 心跳 = Leader 还活着。
-            // 只要心跳不断，Follower 的计时器就一直被压制，不会触发新选举。
-            // 这就是 Leader 用心跳「维持统治」的核心机制。
-            resetElectionTimer();
+        AppendEntriesReply reply{currentTerm_.load(), false, 0, 0};
+
+        // 规则①：过时 term 的 RPC 直接拒绝（发送方是旧 Leader，已被淘汰）
+        if (args.term < currentTerm_.load()) {
+            done(json(reply).dump());
+            return;
         }
-        AppendEntriesReply reply{currentTerm_.load(), success};
+
+        // 收到有效 Leader 的消息：确认自己是 Follower
+        state_.store(State::Follower);
+        leaderId_ = args.leaderId;
+        resetElectionTimer();  // 压制自己的选举超时
+
+        // 规则②（一致性检查）：我的日志里是否存在 prevLogIndex 处的条目，且 term 匹配？
+        //
+        // 这是 Raft 的核心安全机制：Leader 通过「前缀匹配」保证 Follower 和自己历史一致。
+        // 若这里不匹配，Follower 无法安全追加 entries，必须拒绝并给出冲突提示。
+        if (args.prevLogIndex > lastLogIndex()) {
+            // Follower 日志太短，根本没有 prevLogIndex 处的条目
+            reply.conflictIndex = lastLogIndex() + 1;  // 告知 Leader 从这里开始重发
+            reply.conflictTerm  = 0;                   // 0 = 该位置不存在
+            done(json(reply).dump());
+            return;
+        }
+        if (log_[args.prevLogIndex].term != args.prevLogTerm) {
+            // prevLogIndex 处 term 不匹配：找到该冲突 term 在我这里的第一条 index，
+            // 让 Leader 跳过整个冲突 term（比逐条 -1 快得多）
+            uint64_t ct  = log_[args.prevLogIndex].term;
+            uint64_t ci  = args.prevLogIndex;
+            while (ci > 0 && log_[ci - 1].term == ct) --ci;
+            reply.conflictIndex = ci;
+            reply.conflictTerm  = ct;
+            done(json(reply).dump());
+            return;
+        }
+
+        // 规则③：幂等追加
+        // 逐条检查：若现有条目 term 与 entries[i].term 不同，则截断并覆盖；
+        // 若已存在且 term 相同，则跳过（重传消息的幂等处理）。
+        uint64_t insertAt = args.prevLogIndex + 1;
+        for (size_t i = 0; i < args.entries.size(); ++i) {
+            uint64_t logIdx = insertAt + (uint64_t)i;
+            if (logIdx < log_.size()) {
+                if (log_[logIdx].term != args.entries[i].term) {
+                    log_.resize(logIdx);          // 截断冲突点之后的所有条目
+                    log_.push_back(args.entries[i]);
+                }
+                // else：term 相同 = 已有该条目（重传），跳过
+            } else {
+                log_.push_back(args.entries[i]); // 追加新条目
+            }
+        }
+
+        // 规则④：推进 commitIndex
+        // Leader 已提交到 leaderCommit，我也可以安全应用到同样位置（取两者较小）
+        if (args.leaderCommit > commitIndex_.load()) {
+            commitIndex_.store(std::min(args.leaderCommit, lastLogIndex()));
+            applyCommitted();
+        }
+
+        reply.success = true;
         done(json(reply).dump());
     });
 }
@@ -179,7 +225,7 @@ void RaftNode::handleAppendEntries(const std::string &reqJson, RpcServer::Done d
 
 void RaftNode::becomeFollower(uint64_t term) {
     if (state_.load() != State::Follower)
-        LOG_INFO << "[Node " << id_ << "] " << stateName(state_.load()) << " → Follower（term="
+        LOG_INFO << "[Node " << id_ << "] " << stateName(state_.load()) << " → 跟随者（任期="
                  << term << "）";
     state_.store(State::Follower);
     currentTerm_.store(term);
@@ -195,7 +241,7 @@ void RaftNode::becomeCandidate() {
     state_.store(State::Candidate);
     votedFor_             = id_;  // 候选人给自己投一票（Raft 允许自投）
     currentElectionVotes_ = 1;    // 票数从 1 开始（已含自己那票）
-    LOG_INFO << "[Node " << id_ << "] 选举超时 → 候选人，term=" << currentTerm_.load();
+    LOG_INFO << "[Node " << id_ << "] 选举超时 → 候选人，任期=" << currentTerm_.load();
     // 重置选举计时器：如果这一轮在随机超时内没选出 Leader（平票/网络分区），
     // 计时器到期后会自动发起下一轮选举（term 再递增）。随机超时使平票概率极低。
     resetElectionTimer();
@@ -204,14 +250,21 @@ void RaftNode::becomeCandidate() {
 void RaftNode::becomeLeader() {
     state_.store(State::Leader);
     leaderId_ = id_;
-    LOG_INFO << "[Node " << id_ << "] *** 成为 LEADER，term=" << currentTerm_.load() << " ***";
-    // 成为 Leader 后不再需要选举计时器（Leader 不会发起选举）。
-    // 用 ++epoch 让所有已安排但尚未触发的 electionTimerFired 回调全部失效，
-    // 避免 Leader 自己触发选举把自己选下去。
+    LOG_INFO << "[Node " << id_ << "] *** 成为领导者，任期=" << currentTerm_.load() << " ***";
     ++electionEpoch_;
-    // 立刻广播一次心跳，而不等 50ms runEvery 的下一次触发。
-    // 目的：尽快通知所有 Follower「我是新 Leader」，压制它们的选举计时器，
-    // 防止在第一个 50ms 窗口内 Follower 超时发起竞争选举。
+
+    // 初始化 Leader 专属的 per-peer 追踪状态：
+    //   nextIndex[i]  = lastLogIndex + 1   （乐观：先假设 follower 和我一样新）
+    //   matchIndex[i] = 0                  （保守：还不知道 follower 有什么）
+    // 如果 follower 落后，replicateLog 协程会在收到 success=false 后回退 nextIndex。
+    uint64_t nextIdx = lastLogIndex() + 1;
+    for (const auto &peer : peers_) {
+        if (peer.id == id_) continue;
+        nextIndex_[peer.id]  = nextIdx;
+        matchIndex_[peer.id] = 0;
+    }
+
+    // 立刻广播一次复制（空 entries = 心跳），尽快通知所有 Follower 新 Leader 存在。
     heartbeatTick();
 }
 
@@ -305,41 +358,163 @@ FireAndForget RaftNode::collectVote(uint64_t electionTerm, Peer peer) {
     if (reply.voteGranted) {
         ++currentElectionVotes_;
         LOG_INFO << "[Node " << id_ << "] 收到节点 " << peer.id
-                 << " 的投票（已得票=" << currentElectionVotes_ << "/" << quorum_ << "）";
+                 << " 的选票（已得票=" << currentElectionVotes_ << "/" << quorum_ << "，需要=" << quorum_ << "）";
         if (currentElectionVotes_ >= quorum_) becomeLeader();
     }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// §5  心跳：heartbeatTick + sendHeartbeat 协程
+// §5  日志复制 + 心跳合一：heartbeatTick + replicateLog 协程
+//
+// Day33 核心改动：sendHeartbeat（只发空 AppendEntries）→ replicateLog
+//   - entries 为空时 = 纯心跳（维持 Leader 存在感）
+//   - entries 非空时 = 日志复制（携带 [nextIndex, lastLogIndex] 段）
+// 两种情况用同一条 RPC，处理逻辑完全统一。
 // ════════════════════════════════════════════════════════════════════════════
 
 void RaftNode::heartbeatTick() {
     if (state_.load() != State::Leader) return;
     for (const auto &peer : peers_) {
         if (peer.id == id_) continue;
-        sendHeartbeat(peer); // 并发发射，每个 peer 独立协程
+        replicateLog(peer);
     }
 }
 
-FireAndForget RaftNode::sendHeartbeat(Peer peer) {
-    AppendEntriesArgs args{currentTerm_.load(), id_};
-    std::string reqJson = json(args).dump();
+FireAndForget RaftNode::replicateLog(Peer peer) {
+    if (state_.load() != State::Leader) co_return;
 
-    // ── 挂起点 ──────────────────────────────────────────────────────────
+    // 读取本次要发送的起始 index（loop_ 线程，nextIndex_ 无竞争）
+    uint64_t ni = nextIndex_.count(peer.id) ? nextIndex_[peer.id] : lastLogIndex() + 1;
+    if (ni < 1) ni = 1; // 安全下限（哨兵条目不发送）
+
+    uint64_t prevIdx  = ni - 1;
+    uint64_t prevTerm = (prevIdx < log_.size()) ? log_[prevIdx].term : 0;
+
+    // 构造 AppendEntriesArgs：收集 [ni, lastLogIndex] 范围的条目
+    AppendEntriesArgs args;
+    args.term         = currentTerm_.load();
+    args.leaderId     = id_;
+    args.prevLogIndex = prevIdx;
+    args.prevLogTerm  = prevTerm;
+    args.leaderCommit = commitIndex_.load();
+    for (uint64_t i = ni; i <= lastLogIndex(); ++i)
+        args.entries.push_back(log_[i]);
+
+    // ── 挂起点：发出 AppendEntries RPC ──────────────────────────────────
     auto [ok, respJson] = co_await getOrCreateClient(peer)->callAsyncCo(
-        "AppendEntries", reqJson, /*timeoutMs=*/100);
+        "AppendEntries", json(args).dump(), /*timeoutMs=*/100);
 
     // ── 恢复点（loop_ 线程）────────────────────────────────────────────
-    if (!ok) co_return; // 超时或网络故障：下一个 50ms 周期重试
+    if (!ok) co_return;                         // 超时/故障：下个 50ms 重试
+    if (state_.load() != State::Leader) co_return; // 期间失去了 Leader 身份
 
+    AppendEntriesReply reply{};
     try {
-        auto reply = json::parse(respJson).get<AppendEntriesReply>();
-        // 回包 term 更大：自己是"僵尸 Leader"，立刻退位
-        if (reply.term > currentTerm_.load()) becomeFollower(reply.term);
-    } catch (...) {
-        // 解码失败，忽略
+        reply = json::parse(respJson).get<AppendEntriesReply>();
+    } catch (...) { co_return; }
+
+    if (reply.term > currentTerm_.load()) {
+        becomeFollower(reply.term);  // 僵尸 Leader：立刻退位
+        co_return;
     }
+
+    if (reply.success) {
+        // ── 成功：推进 matchIndex / nextIndex ───────────────────────────
+        // 注意：期间可能另一个 replicateLog 协程也成功更新了 matchIndex（并发 RPC），
+        // 只取更大值，避免「回退」（idempotent 更新）。
+        uint64_t newMatch = args.prevLogIndex + (uint64_t)args.entries.size();
+        if (newMatch > matchIndex_[peer.id]) {
+            matchIndex_[peer.id] = newMatch;
+            nextIndex_[peer.id]  = newMatch + 1;
+        }
+        advanceCommitIndex();
+    } else {
+        // ── 失败（一致性检查不过）：用冲突提示加速回退 ─────────────────
+        //
+        // 朴素方式：nextIndex-- 直到匹配，最坏需要 O(log_length) 轮。
+        // 优化方式（Raft 论文 §5.3 hint）：
+        //   conflictTerm==0  → Follower 日志比 prevLogIndex 短，直接跳到 conflictIndex
+        //   conflictTerm!=0  → 在 Leader 日志里找该 term 的最后一条；
+        //                        如果 Leader 也没有该 term，跳到 conflictIndex。
+        uint64_t newNext;
+        if (reply.conflictTerm == 0) {
+            newNext = reply.conflictIndex;
+        } else {
+            // 在 Leader 日志里找 conflictTerm 的最后一条
+            int64_t found = -1;
+            for (int64_t i = (int64_t)lastLogIndex(); i >= 1; --i) {
+                if (log_[i].term == reply.conflictTerm) { found = i + 1; break; }
+            }
+            newNext = (found >= 0) ? (uint64_t)found : reply.conflictIndex;
+        }
+        // 只允许减小 nextIndex（不能因为并发成功回包而增大）
+        if (newNext < nextIndex_[peer.id])
+            nextIndex_[peer.id] = std::max(newNext, uint64_t{1});
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// §6  提交推进 + 状态机应用
+// ════════════════════════════════════════════════════════════════════════════
+
+void RaftNode::advanceCommitIndex() {
+    // Raft Figure 8 规则：Leader 只能直接提交「当前 term」的条目。
+    // 旧 term 的条目会随着新条目的提交「顺带」被提交（commitIndex 单调递增）。
+    // 若允许提交旧 term 条目，会破坏安全性（参见 Raft 论文 Figure 8 的反例）。
+    uint64_t lastIdx = lastLogIndex();
+    for (uint64_t n = lastIdx; n > commitIndex_.load(); --n) {
+        if (log_[n].term != currentTerm_.load()) continue; // Figure 8 过滤
+        int count = 1; // 算上自己
+        for (const auto &peer : peers_) {
+            if (peer.id == id_) continue;
+            if (matchIndex_.count(peer.id) && matchIndex_[peer.id] >= n) ++count;
+        }
+        if (count >= quorum_) {
+            commitIndex_.store(n);
+            LOG_INFO << "[Node " << id_ << "] 提交进度推进到 index=" << n
+                     << "（任期=" << log_[n].term << " 命令=" << log_[n].cmd << ")";
+            applyCommitted();
+            break; // 找到最大可提交 N 后即停（更小的 n 在下轮自然覆盖）
+        }
+    }
+}
+
+void RaftNode::applyCommitted() {
+    // 把 [lastApplied+1, commitIndex] 范围的条目逐条应用到状态机。
+    // applyCallback_ 在 loop_ 线程回调 → 状态机代码天然单线程，无需加锁。
+    while (lastApplied_.load() < commitIndex_.load()) {
+        uint64_t idx = lastApplied_.load() + 1;
+        if (idx >= log_.size()) break; // 防御：不应发生
+        lastApplied_.store(idx);
+        LOG_INFO << "[Node " << id_ << "] 应用日志 index=" << idx
+                 << " 命令=" << log_[idx].cmd;
+        if (applyCallback_) applyCallback_(idx, log_[idx].cmd);
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// §7  外部写入接口：propose
+// ════════════════════════════════════════════════════════════════════════════
+
+void RaftNode::propose(const std::string &cmd) {
+    // propose 可以从任意线程调用（线程安全）。
+    // 通过 runInLoop 把实际追加操作投递到 loop_ 线程，维持 Raft 状态的单线程访问。
+    loop_.runInLoop([this, cmd] {
+        if (state_.load() != State::Leader) {
+            LOG_WARN << "[Node " << id_ << "] 提案被拒绝：当前节点非领导者"
+                     << "（当前领导者ID=" << leaderId_ << ")";
+            return;
+        }
+        // 追加到本地日志（Leader 自己的那份），term = currentTerm
+        log_.push_back(LogEntry{currentTerm_.load(), cmd});
+        LOG_INFO << "[Node " << id_ << "] 追加日志条目 index=" << lastLogIndex()
+                 << " 命令=" << cmd;
+        // 立刻触发一轮复制（不等下一个 50ms heartbeat 周期）
+        for (const auto &peer : peers_) {
+            if (peer.id == id_) continue;
+            replicateLog(peer);
+        }
+    });
 }
 
 uint64_t RaftNode::lastLogIndex() const { return static_cast<uint64_t>(log_.size() - 1); }

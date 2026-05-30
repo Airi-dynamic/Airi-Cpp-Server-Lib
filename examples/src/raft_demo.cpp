@@ -1,19 +1,18 @@
-// raft_demo.cpp —— Raft 选举演示（最多 10 节点，基于 EventLoop 重构版）
+// raft_demo.cpp —— Raft 选举 + 日志复制演示（最多 10 节点）
 //
 // 用法（N 节点集群，默认 3）：
-//   ./raft_demo --id 0 [--nodes N]   # 第 1 个终端
-//   ./raft_demo --id 1 [--nodes N]   # 第 2 个终端
+//   ./raft_demo --id 0 [--nodes N] [--propose-interval <ms>]
+//   ./raft_demo --id 1 [--nodes N]
 //   ...
-//   ./raft_demo --id N-1 [--nodes N] # 第 N 个终端
 //
-//   N 的范围：2 ~ 10（奇数集群推荐：3 / 5 / 7）
-//   端口分配：节点 i 使用 18901 + i
+// Day33 新增：
+//   --propose-interval <ms>   Leader 自动 propose 命令的间隔（默认 2000ms，0=不自动提交）
 //
-// 预期：
-//   - 启动后 150~300ms 内有一个节点打印 "*** 成为 LEADER ***"
-//   - 其余节点的选举超时被 Leader 心跳重置，保持 Follower
+// 预期观察：
+//   - 启动后约 150~300ms 内有一个节点打印 "*** 成为 LEADER ***"
+//   - Leader 每隔 propose-interval 自动提交一条 "cmd-<n>" 命令
+//   - Follower 的 commitIndex/lastApplied 跟随 Leader 推进
 //   - Ctrl+C 杀掉 Leader 后约 300ms 剩余节点重新选出新 Leader
-//   - 逐一启动节点时，未就绪的对端连接拒绝属于正常现象（有退避机制）
 
 #include "log/Logger.h"
 #include "net/SignalHandler.h"
@@ -25,14 +24,17 @@
 #include <thread>
 
 int main(int argc, char **argv) {
-    int myId  = -1;
-    int nodes = 3; // 默认 3 节点集群
+    int myId           = -1;
+    int nodes          = 3;
+    int proposeIntervalMs = 2000; // 默认每 2s propose 一条命令
 
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::strcmp(argv[i], "--id") == 0)
             myId = std::stoi(argv[i + 1]);
         else if (std::strcmp(argv[i], "--nodes") == 0)
             nodes = std::stoi(argv[i + 1]);
+        else if (std::strcmp(argv[i], "--propose-interval") == 0)
+            proposeIntervalMs = std::stoi(argv[i + 1]);
     }
 
     if (nodes < 2 || nodes > 10) {
@@ -41,14 +43,12 @@ int main(int argc, char **argv) {
     }
     if (myId < 0 || myId >= nodes) {
         std::cerr << "用法：raft_demo --id <0.." << (nodes - 1)
-                  << "> [--nodes " << nodes << "]\n";
+                  << "> [--nodes " << nodes << "] [--propose-interval <ms>]\n";
         return 1;
     }
 
-    // 屏蔽 DEBUG 级别的连接生命周期日志，只看 INFO 及以上
     Logger::setLogLevel(Logger::INFO);
 
-    // 预定义 10 个节点的地址与端口（端口 18901~18910）
     const std::vector<raft::Peer> allPeers = {
         {0, "127.0.0.1", 18901},
         {1, "127.0.0.1", 18902},
@@ -62,11 +62,16 @@ int main(int argc, char **argv) {
         {9, "127.0.0.1", 18910},
     };
 
-    // 只取前 nodes 个节点组成本次集群
     std::vector<raft::Peer> peers(allPeers.begin(), allPeers.begin() + nodes);
     uint16_t myPort = peers[myId].port;
 
     raft::RaftNode node(myId, peers, myPort);
+
+    // 注册状态机回调：每条提交的命令都打印一行（可换成真正的 KV 应用）
+    node.setApplyCallback([myId](uint64_t index, const std::string &cmd) {
+        std::cout << "[Node " << myId << "] ✓ APPLIED  index=" << index
+                  << "  cmd=" << cmd << "\n" << std::flush;
+    });
 
     static std::atomic<bool> stopFlag{false};
     Signal::signal(SIGINT,  [] { stopFlag.store(true); });
@@ -74,10 +79,43 @@ int main(int argc, char **argv) {
 
     node.start();
 
-    // 主线程空转等待信号：node 的所有工作都在它自己的线程里跑
-    while (!stopFlag.load())
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    // ── 主循环：状态展示 + 自动 propose ────────────────────────────────
+    int proposeCounter = 0;
+    auto lastPropose   = std::chrono::steady_clock::now();
+
+    while (!stopFlag.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+        // 状态行：每 500ms 打印一次
+        const char *stateStr = "Follower";
+        if (node.getState() == raft::State::Leader)   stateStr = "LEADER";
+        if (node.getState() == raft::State::Candidate) stateStr = "Candidate";
+
+        std::cout << "[Node " << myId << "] "
+                  << stateStr
+                  << "  term=" << node.getCurrentTerm()
+                  << "  logSize=" << (node.getLastLogIndex() + 1)
+                  << "  commit=" << node.getCommitIndex()
+                  << "  applied=" << node.getLastApplied()
+                  << "  leaderId=" << node.getLeaderId()
+                  << "\n" << std::flush;
+
+        // 自动 propose：仅当自己是 Leader 且开启了 propose
+        if (proposeIntervalMs > 0 && node.isLeader()) {
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - lastPropose).count();
+            if (elapsed >= proposeIntervalMs) {
+                lastPropose = now;
+                std::string cmd = "cmd-" + std::to_string(proposeCounter++);
+                std::cout << "[Node " << myId << "] → propose \"" << cmd << "\"\n"
+                          << std::flush;
+                node.propose(cmd);
+            }
+        }
+    }
 
     node.stop();
     return 0;
 }
+

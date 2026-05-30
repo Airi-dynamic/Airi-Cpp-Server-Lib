@@ -43,11 +43,6 @@ struct FireAndForget {
     };
 };
 
-// ─── ResumeOnLoop<Loop> ───────────────────────────────────────────────────────
-//
-// 泛型设计避免 Task.h 直接依赖 EventLoop.h，减少包含层次。
-// Loop 需要提供 queueInLoop(std::function<void()>) 成员函数。
-//
 template<typename Loop>
 struct ResumeOnLoop {
     Loop *loop;
